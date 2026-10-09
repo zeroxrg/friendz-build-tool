@@ -144,7 +144,9 @@ cmd_build() {
 
   mkdir -p "$DOWNLOAD_DIR"
 
-  local work; work="$(mktemp -d)"
+  # Deliberately not local: the EXIT traps installed below fire after this
+  # function returns, and a local would already be out of scope by then.
+  work="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$work'" EXIT
 
@@ -246,10 +248,8 @@ cmd_build() {
 
   local dest
   if [ "$lang" = "rust" ]; then
-    # The rust workflow uploads a dist/ directory: either a tarball or raw
-    # binaries with a .bin suffix.
     # The workflow uploads a dist/ directory whose contents depend on the crate:
-    # a tarball or .bin files for binaries, .rlib/.rmeta for a library.
+    # a tarball or .bin files for binaries, .rlib for a library.
     mapfile -t files < <(find "$work/out" -type f \
       \( -name '*.tar.gz' -o -name '*.bin' -o -name '*.rlib' -o -name '*.rmeta' \) | sort)
     [ ${#files[@]} -gt 0 ] || die "artifact contained no recognizable build output"

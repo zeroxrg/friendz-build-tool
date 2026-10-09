@@ -278,13 +278,35 @@ jobs:
             [ ${#bins[@]} -gt 0 ] && break
           done
 
-          # A library crate has [lib] and no binaries. Its distributable output
-          # is the rlib plus the generated metadata, so fall back to those.
+          # A library crate has [lib] and no binaries. Its own rlib is the
+          # deliverable. Cargo hashes filenames, and dependency rlibs sit in
+          # deps/, so restrict the search to the top-level artifact dir to
+          # avoid shipping every transitive crate.
           kind="bin"
           if [ ${#bins[@]} -eq 0 ]; then
             kind="lib"
             while IFS= read -r -d '' f; do bins+=("$f"); done \
-              < <(find target -type f \( -name '*.rlib' -o -name '*.rmeta' \) -print0)
+              < <(find "$d" -maxdepth 1 -type f -name '*.rlib' -print0)
+            if [ ${#bins[@]} -eq 0 ]; then
+              # No target/<triple>/<profile> dir: cargo put it somewhere else.
+              while IFS= read -r -d '' f; do bins+=("$f"); done \
+                < <(find target -maxdepth 3 -type f -name '*.rlib' -not -path '*/deps/*' -print0)
+            fi
+          fi
+
+          # Keep only artifacts whose name matches the crate, so a lib build
+          # returns one rlib rather than every dependency.
+          crate_name="$(sed -n 's/^name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$kind" = "lib" ] && [ -n "$crate_name" ]; then
+            filtered=()
+            for b in "${bins[@]}"; do
+              if [[ "$(basename "$b")" == *"$crate_name"* ]]; then
+                filtered+=("$b")
+              fi
+            done
+            if [ ${#filtered[@]} -gt 0 ]; then
+              bins=("${filtered[@]}")
+            fi
           fi
 
           if [ ${#bins[@]} -eq 0 ]; then

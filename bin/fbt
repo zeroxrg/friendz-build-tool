@@ -73,19 +73,59 @@ package_project() {
     .
 }
 
+usage_build() {
+  cat <<'USAGE'
+usage: fbt build <project-dir> [options]
+
+Common:
+  --tool REPO        tool repo (default: zeroxrg/friendz-build-tool)
+
+Android (default):
+  --variant NAME     build variant (default: debug)
+
+Rust (--rust):
+  --profile NAME     release | dev            (default: release)
+  --target TRIPLE    rustc target triple      (default: host)
+  --features LIST    comma-separated features
+  --all-features     pass --all-features
+  --no-default-features
+  --tests            run cargo test before building
+  --raw              upload bare binaries instead of a tarball
+
+Example:
+  fbt build ~/Hologram-Internal/rust-browser --rust --tests
+USAGE
+}
+
 cmd_build() {
-  [ $# -ge 1 ] || die "usage: fbt build <project-dir> [--variant debug]"
+  [ $# -ge 1 ] || { usage_build; exit 1; }
 
   local dir="$1"; shift
   local variant="debug"
   local tool_repo="$TOOL_REPO"
 
+  local lang="android"
+  local profile="release"
+  local target=""
+  local features=""
+  local all_features="false"
+  local no_default_features="false"
+  local run_tests="false"
+  local raw="false"
+
   while [ $# -gt 0 ]; do
     case "$1" in
-      --variant) variant="${2:-}"; shift 2 ;;
       --tool)    tool_repo="${2:-}"; shift 2 ;;
-      -h|--help)
-        sed -n '2,12p' "$0"; exit 0 ;;
+      --variant) variant="${2:-}"; shift 2 ;;
+      --rust)    lang="rust"; shift ;;
+      --profile) profile="${2:-}"; shift 2 ;;
+      --target)  target="${2:-}"; shift 2 ;;
+      --features) features="${2:-}"; shift 2 ;;
+      --all-features) all_features="true"; shift ;;
+      --no-default-features) no_default_features="true"; shift ;;
+      --tests)   run_tests="true"; shift ;;
+      --raw)     raw="true"; shift ;;
+      -h|--help) usage_build; exit 0 ;;
       *) die "unknown argument: $1" ;;
     esac
   done
@@ -138,19 +178,41 @@ cmd_build() {
   cleanup() { gh gist delete "$gist_id" --yes >/dev/null 2>&1 || true; }
   trap 'cleanup; rm -rf "$work"' EXIT
 
-  info "dispatching to $tool_repo"
-  gh api "repos/$tool_repo/dispatches" \
-    -f event_type=build \
-    -F "client_payload[project]=$name" \
-    -F "client_payload[variant]=$variant" \
-    -f "client_payload[gist_id]=$gist_id" >/dev/null \
-    || die "dispatch failed"
+  local workflow="android.yml"
+  local event_type="build"
+  local artifact_name=""
+
+  if [ "$lang" = "rust" ]; then
+    workflow="rust.yml"
+    event_type="rust"
+    info "dispatching rust build: profile=$profile target=${target:-host} features=${features:-none} tests=$run_tests raw=$raw"
+    gh api "repos/$tool_repo/dispatches" \
+      -f "event_type=$event_type" \
+      -F "client_payload[project]=$name" \
+      -f "client_payload[gist_id]=$gist_id" \
+      -f "client_payload[profile]=$profile" \
+      -f "client_payload[target]=$target" \
+      -f "client_payload[features]=$features" \
+      -f "client_payload[all_features]=$all_features" \
+      -f "client_payload[no_default_features]=$no_default_features" \
+      -f "client_payload[run_tests]=$run_tests" \
+      -f "client_payload[raw]=$raw" >/dev/null \
+      || die "dispatch failed"
+  else
+    info "dispatching android build: variant=$variant"
+    gh api "repos/$tool_repo/dispatches" \
+      -f "event_type=$event_type" \
+      -F "client_payload[project]=$name" \
+      -F "client_payload[variant]=$variant" \
+      -f "client_payload[gist_id]=$gist_id" >/dev/null \
+      || die "dispatch failed"
+  fi
 
   info "waiting for run to start"
   local run_id=""
   for _ in $(seq 1 30); do
     sleep 2
-    run_id="$(gh run list --repo "$tool_repo" --workflow android.yml \
+    run_id="$(gh run list --repo "$tool_repo" --workflow "$workflow" \
       --event repository_dispatch --limit 1 \
       --json databaseId,status --jq '.[0].databaseId // empty' 2>/dev/null || true)"
     [ -n "$run_id" ] && break
@@ -171,12 +233,29 @@ cmd_build() {
   gh run download "$run_id" --repo "$tool_repo" --name "$artifact" \
     --dir "$work/out" >/dev/null
 
-  local apk; apk="$(find "$work/out" -name '*.apk' -type f | head -1)"
-  [ -n "$apk" ] || die "artifact contained no APK"
-
-  local dest="$DOWNLOAD_DIR/${name}-${variant}.apk"
-  mv "$apk" "$dest"
-  info "APK: $dest ($(du -h "$dest" | cut -f1))"
+  local dest
+  if [ "$lang" = "rust" ]; then
+    # The rust workflow uploads a dist/ directory: either a tarball or raw
+    # binaries with a .bin suffix.
+    mapfile -t files < <(find "$work/out" -type f \( -name '*.tar.gz' -o -name '*.bin' \) | sort)
+    [ ${#files[@]} -gt 0 ] || die "artifact contained no tarball or binary"
+    local moved=()
+    for f in "${files[@]}"; do
+      dest="$DOWNLOAD_DIR/$(basename "$f")"
+      mv "$f" "$dest"
+      moved+=("$dest")
+    done
+    for d in "${moved[@]}"; do
+      info "artifact: $d ($(du -h "$d" | cut -f1))"
+    done
+    dest="${moved[0]}"
+  else
+    local apk; apk="$(find "$work/out" -name '*.apk' -type f | head -1)"
+    [ -n "$apk" ] || die "artifact contained no APK"
+    dest="$DOWNLOAD_DIR/${name}-${variant}.apk"
+    mv "$apk" "$dest"
+    info "APK: $dest ($(du -h "$dest" | cut -f1))"
+  fi
 
   cleanup
   trap 'rm -rf "$work"' EXIT
@@ -188,6 +267,6 @@ load_config
 
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;
-  ""|-h|--help) sed -n '2,12p' "$0" ;;
+  ""|-h|--help) usage_build ;;
   *) die "unknown command: $1" ;;
 esac

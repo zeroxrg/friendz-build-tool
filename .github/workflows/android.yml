@@ -69,13 +69,13 @@ jobs:
             exit 1
           fi
           # Accept either name so a hand-made test gist works too.
-          url=$(gh api "gists/$GIST_ID" \
+          url=$(GH_TOKEN="$GIST_TOKEN" gh api "gists/$GIST_ID" \
             --jq '.files["src.tar.gz.b64"].raw_url // .files["src.tar.gz"].raw_url')
           if [ -z "$url" ] || [ "$url" = "null" ]; then
             echo "::error::Gist $GIST_ID has no src.tar.gz.b64 file."
             exit 1
           fi
-          gh api -H "Authorization: Bearer $GIST_TOKEN" "$url" > src.b64
+          curl -fsSL -H "Authorization: Bearer $GIST_TOKEN" "$url" -o src.b64
           base64 -d src.b64 > src.tar.gz
           rm -f src.b64
           ls -l src.tar.gz
@@ -159,7 +159,7 @@ jobs:
             echo "Nothing to clean up."
             exit 0
           fi
-          if gh api -X DELETE "gists/$GIST_ID" 2>/dev/null; then
+          if GH_TOKEN="$GIST_TOKEN" gh api -X DELETE "gists/$GIST_ID" 2>/dev/null; then
             echo "Deleted source gist $GIST_ID"
           else
             echo "::warning::Could not delete gist $GIST_ID. Remove it manually."

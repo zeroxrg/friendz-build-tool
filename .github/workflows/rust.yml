@@ -100,7 +100,7 @@ jobs:
             echo "tests=$(pick "$EV_TESTS" "$IN_TESTS")"
             echo "raw=$(pick "$EV_RAW" "$IN_RAW")"
           } >> "$GITHUB_OUTPUT"
-          echo "project=${{ steps.params.outputs.project }} profile=${{ steps.params.outputs.profile }} target=${{ steps.params.outputs.target:-host}}"
+          echo "project=${{ steps.params.outputs.project }} profile=${{ steps.params.outputs.profile }} target=${{ steps.params.outputs.target }}"
 
       - name: Validate inputs
         env:

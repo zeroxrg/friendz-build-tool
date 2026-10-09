@@ -1,37 +1,39 @@
 #!/usr/bin/env bash
-# fbt - build Android projects through GitHub Actions.
+# fbt - build Android and Rust projects on GitHub-hosted runners.
 #
-# Source is packaged into a secret gist, dispatched to the public build tool
-# repo, and the resulting APK lands in ~/Downloads. The gist is deleted after
-# the build regardless of outcome, so nothing accumulates.
+# Source is packaged into a secret gist, dispatched to the build tool repo,
+# and the output lands in a local downloads directory. The gist is deleted
+# after the build regardless of outcome, so nothing accumulates.
 #
 # Usage:
-#   fbt build <project-dir> [--variant debug] [--tool owner/repo]
+#   fbt build <project-dir> [options]
 #
-# Config (optional, defaults shown):
+# Config (optional):
 #   ~/.config/fbt/config
-#     TOOL_REPO=zeroxrg/friendz-build-tool
-#     DOWNLOAD_DIR=~/Downloads
+#     TOOL_REPO=<owner>/<repo>
+#     DOWNLOAD_DIR=<path>
+#
+# Overrides without a config file:
+#   FBT_TOOL_REPO=<owner>/<repo> FBT_DOWNLOAD_DIR=<path> fbt build <dir>
 
 set -euo pipefail
 
-DEFAULT_TOOL_REPO="${FBT_TOOL_REPO:-zeroxrg/friendz-build-tool}"
+DEFAULT_TOOL_REPO="${FBT_TOOL_REPO:-}"
 DOWNLOAD_DIR="${FBT_DOWNLOAD_DIR:-$HOME/Downloads}"
 
 die() { printf 'fbt: %s\n' "$1" >&2; exit 1; }
 info() { printf '  %s\n' "$1" >&2; }
 
 load_config() {
-  local cfg="$HOME/.config/fbt/config"
+  local cfg="${FBT_CONFIG:-$HOME/.config/fbt/config}"
+  TOOL_REPO="${TOOL_REPO:-$DEFAULT_TOOL_REPO}"
   if [ -f "$cfg" ]; then
     # shellcheck disable=SC1090
     source "$cfg"
     TOOL_REPO="${TOOL_REPO:-$DEFAULT_TOOL_REPO}"
     DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/Downloads}"
-  else
-    TOOL_REPO="$DEFAULT_TOOL_REPO"
   fi
-}
+  }
 
 require() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed."
@@ -80,7 +82,7 @@ usage_build() {
 usage: fbt build <project-dir> [options]
 
 Common:
-  --tool REPO        tool repo (default: zeroxrg/friendz-build-tool)
+  --tool REPO        tool repo (owner/name)
 
 Android (default):
   --variant NAME     build variant (default: debug)
@@ -94,8 +96,9 @@ Rust (--rust):
   --tests            run cargo test before building
   --raw              upload bare binaries instead of a tarball
 
-Example:
-  fbt build ~/Hologram-Internal/rust-browser --rust --tests
+Examples:
+  fbt build ./my-android-app
+  fbt build ./my-crate --rust --tests
 USAGE
 }
 
@@ -131,6 +134,8 @@ cmd_build() {
       *) die "unknown argument: $1" ;;
     esac
   done
+
+  [ -n "$tool_repo" ] || die "no tool repo configured. Pass --tool <owner>/<repo>, set TOOL_REPO in ~/.config/fbt/config, or export FBT_TOOL_REPO."
 
   [ -d "$dir" ] || die "not a directory: $dir"
   dir="$(cd "$dir" && pwd)"
@@ -251,7 +256,8 @@ cmd_build() {
     # The workflow uploads a dist/ directory whose contents depend on the crate:
     # a tarball or .bin files for binaries, .rlib for a library.
     mapfile -t files < <(find "$work/out" -type f \
-      \( -name '*.tar.gz' -o -name '*.bin' -o -name '*.rlib' -o -name '*.rmeta' \) | sort)
+      \( -name '*.tar.gz' -o -name '*.bin' -o -name '*.rlib' \
+         -o -name '*.so' -o -name '*.dylib' -o -name '*.dll' -o -name '*.a' \) | sort)
     [ ${#files[@]} -gt 0 ] || die "artifact contained no recognizable build output"
     local moved=()
     for f in "${files[@]}"; do

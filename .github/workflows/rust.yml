@@ -270,61 +270,72 @@ jobs:
           echo "artifacts under: $d"
 
           shopt -s nullglob
-          bins=()
-          for cand in "$d" "target/${TRIPLE}/${SUBDIR}" "target/${SUBDIR}"; do
+          candidates=("target/${TRIPLE}/${SUBDIR}" "target/${SUBDIR}" "target/${TRIPLE}" "target")
+
+          # Every artifact type cargo can emit for a first-party crate:
+          # executables, native libs from cdylib/staticlib crate-types, and
+          # rlib/rmeta from a plain library. Search order is bin, native, lib
+          # because a crate with [[bin]] wants the binary first.
+          kind=""
+          found=()
+
+          for cand in "${candidates[@]}"; do
             [ -d "$cand" ] || continue
-            while IFS= read -r -d '' f; do bins+=("$f"); done \
+            while IFS= read -r -d '' f; do found+=("$f"); done \
               < <(find "$cand" -maxdepth 1 -type f -executable ! -name '*.d' -print0)
-            [ ${#bins[@]} -gt 0 ] && break
+            [ ${#found[@]} -gt 0 ] && { kind="bin"; break; }
           done
 
-          # A library crate has [lib] and no binaries. Its own rlib is the
-          # deliverable. Cargo hashes filenames, and dependency rlibs sit in
-          # deps/, so restrict the search to the top-level artifact dir to
-          # avoid shipping every transitive crate.
-          kind="bin"
-          if [ ${#bins[@]} -eq 0 ]; then
-            kind="lib"
-            while IFS= read -r -d '' f; do bins+=("$f"); done \
-              < <(find "$d" -maxdepth 1 -type f -name '*.rlib' -print0)
-            if [ ${#bins[@]} -eq 0 ]; then
-              # No target/<triple>/<profile> dir: cargo put it somewhere else.
-              while IFS= read -r -d '' f; do bins+=("$f"); done \
-                < <(find target -maxdepth 3 -type f -name '*.rlib' -not -path '*/deps/*' -print0)
-            fi
+          if [ ${#found[@]} -eq 0 ]; then
+            kind="native"
+            for cand in "${candidates[@]}"; do
+              [ -d "$cand" ] || continue
+              while IFS= read -r -d '' f; do found+=("$f"); done \
+                < <(find "$cand" -maxdepth 1 -type f \
+                      \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' -o -name '*.a' \) \
+                      ! -name '*.d' -print0)
+              [ ${#found[@]} -gt 0 ] && break
+            done
           fi
 
-          # Keep only artifacts whose name matches the crate, so a lib build
-          # returns one rlib rather than every dependency.
+          if [ ${#found[@]} -eq 0 ]; then
+            kind="lib"
+            for cand in "${candidates[@]}"; do
+              [ -d "$cand" ] || continue
+              while IFS= read -r -d '' f; do found+=("$f"); done \
+                < <(find "$cand" -maxdepth 1 -type f -name '*.rlib' -print0)
+              [ ${#found[@]} -gt 0 ] && break
+            done
+          fi
+
+          # Narrow to the crate's own artifacts. Dependency artifacts live in
+          # deps/, but a cdylib or staticlib build can still copy some to the
+          # top level, so match on the crate name from Cargo.toml.
           crate_name="$(sed -n 's/^name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [ "$kind" = "lib" ] && [ -n "$crate_name" ]; then
+          if [ -n "$crate_name" ] && [ "$kind" != "bin" ]; then
             filtered=()
-            for b in "${bins[@]}"; do
+            for b in "${found[@]}"; do
               if [[ "$(basename "$b")" == *"$crate_name"* ]]; then
                 filtered+=("$b")
               fi
             done
-            if [ ${#filtered[@]} -gt 0 ]; then
-              bins=("${filtered[@]}")
-            fi
+            [ ${#filtered[@]} -gt 0 ] && found=("${filtered[@]}")
           fi
 
-          if [ ${#bins[@]} -eq 0 ]; then
-            echo "::error::Build produced neither executables nor rlibs."
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "::error::Build produced no recognisable artifacts."
             find target -maxdepth 3 -type f | head -30 || true
             exit 1
           fi
-          printf 'Found %d %s artifact(s)\n' "${#bins[@]}" "$kind"
+          printf 'Found %d %s artifact(s)\n' "${#found[@]}" "$kind"
 
           names=""
-          for b in "${bins[@]}"; do
+          for b in "${found[@]}"; do
             base="$(basename "$b")"
-            if [ "$kind" = "lib" ]; then
+            if [ "$RAW" = "true" ] || [ "$kind" = "lib" ] || [ "$kind" = "native" ]; then
+              # Raw mode, plus libraries whose filename already carries the
+              # correct extension, go in dist/ as-is.
               cp "$b" "dist/$base"
-            elif [ "$RAW" = "true" ]; then
-              # Bare binaries get a suffix so the artifact is self-describing.
-              cp "$b" "dist/${base}.bin"
-              base="${base}.bin"
             else
               mkdir -p dist/pkg
               cp "$b" "dist/pkg/$base"
@@ -332,10 +343,8 @@ jobs:
             names="$names $base"
           done
 
-          if [ "$kind" = "lib" ]; then
-            echo "mode=lib" >> "$GITHUB_OUTPUT"
-          elif [ "$RAW" = "true" ]; then
-            echo "mode=raw" >> "$GITHUB_OUTPUT"
+          if [ "$RAW" = "true" ] || [ "$kind" = "lib" ] || [ "$kind" = "native" ]; then
+            echo "mode=$kind" >> "$GITHUB_OUTPUT"
           else
             for extra in README.md README LICENSE LICENSE-MIT LICENSE-APACHE COPYING; do
               if [ -f "$extra" ]; then cp "$extra" dist/pkg/; fi

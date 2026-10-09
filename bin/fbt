@@ -184,10 +184,11 @@ cmd_build() {
   local workflow="android.yml"
   local event_type="build"
 
-  # Recorded before dispatch so a previously finished run cannot be mistaken
-  # for this one when the run list is polled.
+  # Captured at dispatch time. The window has to be tight: a loose one lets a
+  # run from a previous invocation match, and fbt would then wait on a build
+  # for a gist that local cleanup already deleted.
   local after_epoch
-  after_epoch="$(date -u -d '1 minute ago' +%s 2>/dev/null || date -u +%s)"
+  after_epoch="$(date -u +%s)"
 
   if [ "$lang" = "rust" ]; then
     workflow="rust.yml"

@@ -110,15 +110,21 @@ cmd_build() {
   info "packaging $name"
   package_project "$dir" "$tarball" || die "packaging failed"
 
+  # Gists only accept text. Base64 is the transport encoding; the build
+  # workflow decodes it back to a tarball before extracting.
+  local b64="$work/src.tar.gz.b64"
+  base64 -w 0 "$tarball" > "$b64"
+  rm -f "$tarball"
+
   local size
-  size="$(du -h "$tarball" | cut -f1)"
-  info "tarball is $size"
+  size="$(du -h "$b64" | cut -f1)"
+  info "encoded source is $size"
 
   info "uploading source to secret gist"
   # No --public flag: gists are secret by default and only visible to this
-  # account unless explicitly published. This is the flag we want.
+  # account unless explicitly published.
   local gist_url
-  gist_url="$(gh gist create "$tarball" 2>&1)" \
+  gist_url="$(gh gist create "$b64" 2>&1)" \
     || die "gist upload failed: $gist_url"
   local gist_id
   gist_id="$(printf '%s' "$gist_url" | sed -n 's#.*/gist/\([a-f0-9]*\).*#\1#p' | head -1)"

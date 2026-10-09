@@ -1,0 +1,177 @@
+name: android
+
+on:
+  repository_dispatch:
+    types: [build]
+  workflow_call:
+    inputs:
+      gist_id:
+        description: 'ID of the secret gist holding src.tar.gz'
+        required: true
+        type: string
+      project:
+        description: 'Project name, used for artifact naming'
+        required: false
+        type: string
+        default: 'App'
+      variant:
+        description: 'Gradle build variant'
+        required: false
+        type: string
+        default: 'debug'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.event.client_payload.gist_id || inputs.gist_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Resolve inputs
+        id: params
+        env:
+          EV_GIST: ${{ github.event.client_payload.gist_id }}
+          EV_PROJECT: ${{ github.event.client_payload.project }}
+          EV_VARIANT: ${{ github.event.client_payload.variant }}
+          IN_GIST: ${{ inputs.gist_id }}
+          IN_PROJECT: ${{ inputs.project }}
+          IN_VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          pick() {
+            if [ -n "$1" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+          }
+          {
+            echo "gist=$(pick "$EV_GIST" "$IN_GIST")"
+            echo "project=$(pick "$EV_PROJECT" "$IN_PROJECT")"
+            echo "variant=$(pick "$EV_VARIANT" "$IN_VARIANT")"
+          } >> "$GITHUB_OUTPUT"
+          echo "project=${{ steps.params.outputs.project }} variant=${{ steps.params.outputs.variant }}"
+
+      - name: Fetch source from secret gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ steps.params.outputs.gist }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GIST_TOKEN" ]; then
+            echo "::error::GIST_TOKEN secret is not set on this repository."
+            exit 1
+          fi
+          if [ -z "$GIST_ID" ]; then
+            echo "::error::No gist id supplied."
+            exit 1
+          fi
+          url=$(gh api "gists/$GIST_ID" --jq '.files["src.tar.gz"].raw_url')
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "::error::Gist $GIST_ID has no src.tar.gz file."
+            exit 1
+          fi
+          gh api -H "Authorization: Bearer $GIST_TOKEN" "$url" > src.tar.gz
+          ls -l src.tar.gz
+
+      - name: Extract source
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          tar xzf src.tar.gz -C src
+          rm -f src.tar.gz
+          ls -A src
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.0'
+
+      - name: Build APK
+        working-directory: src
+        env:
+          VARIANT: ${{ steps.params.outputs.variant }}
+        run: |
+          set -euo pipefail
+          # Prefer the project's wrapper when one exists, otherwise fall back to
+          # the Gradle installed by setup-gradle. Several projects on this
+          # account have no wrapper committed.
+          if [ -x ./gradlew ]; then
+            GRADLE="./gradlew"
+          else
+            GRADLE="gradle"
+          fi
+          cap="$(printf '%s' "${VARIANT:0:1}" | tr '[:lower:]' '[:upper:]')${VARIANT:1}"
+          task="assemble${cap}"
+          echo "Running: $GRADLE $task"
+          "$GRADLE" --no-daemon --stacktrace "$task"
+
+      - name: Locate APK
+        id: apk
+        working-directory: src
+        env:
+          VARIANT: ${{ steps.params.outputs.variant }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mapfile -t apks < <(find . -name '*.apk' -type f -not -path './.gradle/*')
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "::error::Build succeeded but produced no APK."
+            exit 1
+          fi
+          printf 'Found %d APK(s)\n' "${#apks[@]}"
+          best=""
+          for a in "${apks[@]}"; do
+            if [[ "$a" == *"$VARIANT"* ]]; then best="$a"; fi
+          done
+          if [ -z "$best" ]; then best="${apks[0]}"; fi
+          cp "$best" out.apk
+          echo "picked=$best" >> "$GITHUB_OUTPUT"
+          echo "bytes=$(stat -c %s out.apk)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ steps.params.outputs.project }}-${{ steps.params.outputs.variant }}
+          path: src/out.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Delete source gist
+        if: always()
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ steps.params.outputs.gist }}
+        run: |
+          if [ -z "$GIST_TOKEN" ] || [ -z "$GIST_ID" ]; then
+            echo "Nothing to clean up."
+            exit 0
+          fi
+          if gh api -X DELETE "gists/$GIST_ID" 2>/dev/null; then
+            echo "Deleted source gist $GIST_ID"
+          else
+            echo "::warning::Could not delete gist $GIST_ID. Remove it manually."
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          PROJECT: ${{ steps.params.outputs.project }}
+          VARIANT: ${{ steps.params.outputs.variant }}
+          PICKED: ${{ steps.apk.outputs.picked }}
+          BYTES: ${{ steps.apk.outputs.bytes }}
+        run: |
+          {
+            echo "### fbt build"
+            echo "- project: \`$PROJECT\`"
+            echo "- variant: \`$VARIANT\`"
+            echo "- apk: \`$PICKED\` (${BYTES:-0} bytes)"
+          } >> "$GITHUB_STEP_SUMMARY"

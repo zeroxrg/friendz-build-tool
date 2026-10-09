@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# fbt - build Android projects through GitHub Actions.
+#
+# Source is packaged into a secret gist, dispatched to the public build tool
+# repo, and the resulting APK lands in ~/Downloads. The gist is deleted after
+# the build regardless of outcome, so nothing accumulates.
+#
+# Usage:
+#   fbt build <project-dir> [--variant debug] [--tool owner/repo]
+#
+# Config (optional, defaults shown):
+#   ~/.config/fbt/config
+#     TOOL_REPO=zeroxrg/friendz-build-tool
+#     DOWNLOAD_DIR=~/Downloads
+
+set -euo pipefail
+
+DEFAULT_TOOL_REPO="${FBT_TOOL_REPO:-zeroxrg/friendz-build-tool}"
+DOWNLOAD_DIR="${FBT_DOWNLOAD_DIR:-$HOME/Downloads}"
+
+die() { printf 'fbt: %s\n' "$1" >&2; exit 1; }
+info() { printf '  %s\n' "$1" >&2; }
+
+load_config() {
+  local cfg="$HOME/.config/fbt/config"
+  if [ -f "$cfg" ]; then
+    # shellcheck disable=SC1090
+    source "$cfg"
+    TOOL_REPO="${TOOL_REPO:-$DEFAULT_TOOL_REPO}"
+    DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/Downloads}"
+  else
+    TOOL_REPO="$DEFAULT_TOOL_REPO"
+  fi
+}
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed."
+}
+
+# Archive a project directory, honoring its .gitignore where possible.
+package_project() {
+  local dir="$1"
+  local dest="$2"
+
+  # If this is a git repo with a committed tree, archive tracked files only.
+  # That naturally excludes build/, .gradle/, *.apk and anything gitignored.
+  if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    local dirty
+    dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
+    if [ "$dirty" -gt 0 ]; then
+      info "note: $dirty uncommitted change(s) will be included"
+    fi
+    # -C keeps paths relative to the repo root inside the tarball.
+    if git -C "$dir" ls-files --error-unmatch . >/dev/null 2>&1; then
+      git -C "$dir" archive --format=tar HEAD -o "$dest" 2>/dev/null && return 0
+      info "git archive failed, falling back to tar"
+    fi
+  fi
+
+  # Fallback: tar the directory, excluding the usual build noise.
+  tar czf "$dest" \
+    -C "$dir" \
+    --exclude='./build' \
+    --exclude='*/build' \
+    --exclude='./.gradle' \
+    --exclude='*/.gradle' \
+    --exclude='./.git' \
+    --exclude='*/.git' \
+    --exclude='./.idea' \
+    --exclude='*.apk' \
+    --exclude='*.aab' \
+    --exclude='local.properties' \
+    .
+}
+
+cmd_build() {
+  [ $# -ge 1 ] || die "usage: fbt build <project-dir> [--variant debug]"
+
+  local dir="$1"; shift
+  local variant="debug"
+  local tool_repo="$TOOL_REPO"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --variant) variant="${2:-}"; shift 2 ;;
+      --tool)    tool_repo="${2:-}"; shift 2 ;;
+      -h|--help)
+        sed -n '2,12p' "$0"; exit 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  [ -d "$dir" ] || die "not a directory: $dir"
+  dir="$(cd "$dir" && pwd)"
+  local name; name="$(basename "$dir")"
+
+  require gh
+  require tar
+  require git
+
+  gh auth status >/dev/null 2>&1 || die "gh is not authenticated. Run 'gh auth login'."
+
+  mkdir -p "$DOWNLOAD_DIR"
+
+  local work; work="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" EXIT
+
+  local tarball="$work/src.tar.gz"
+  info "packaging $name"
+  package_project "$dir" "$tarball" || die "packaging failed"
+
+  local size
+  size="$(du -h "$tarball" | cut -f1)"
+  info "tarball is $size"
+
+  info "uploading source to secret gist"
+  # No --public flag: gists are secret by default and only visible to this
+  # account unless explicitly published. This is the flag we want.
+  local gist_url
+  gist_url="$(gh gist create "$tarball" 2>&1)" \
+    || die "gist upload failed: $gist_url"
+  local gist_id
+  gist_id="$(printf '%s' "$gist_url" | sed -n 's#.*/gist/\([a-f0-9]*\).*#\1#p' | head -1)"
+  [ -n "$gist_id" ] || die "could not determine gist id from: $gist_url"
+  info "gist $gist_id"
+
+  # Best-effort cleanup on any early exit.
+  cleanup() { gh gist delete "$gist_id" --yes >/dev/null 2>&1 || true; }
+  trap 'cleanup; rm -rf "$work"' EXIT
+
+  info "dispatching to $tool_repo"
+  gh api "repos/$tool_repo/dispatches" \
+    -f event_type=build \
+    -F "client_payload[project]=$name" \
+    -F "client_payload[variant]=$variant" \
+    -f "client_payload[gist_id]=$gist_id" >/dev/null \
+    || die "dispatch failed"
+
+  info "waiting for run to start"
+  local run_id=""
+  for _ in $(seq 1 30); do
+    sleep 2
+    run_id="$(gh run list --repo "$tool_repo" --workflow android.yml \
+      --event repository_dispatch --limit 1 \
+      --json databaseId,status --jq '.[0].databaseId // empty' 2>/dev/null || true)"
+    [ -n "$run_id" ] && break
+  done
+  [ -n "$run_id" ] || die "no run appeared within 60s"
+
+  info "run $run_id"
+  if ! gh run watch "$run_id" --repo "$tool_repo" --exit-status; then
+    die "build failed. Logs: gh run view $run_id --repo $tool_repo --log-failed"
+  fi
+
+  local artifact
+  artifact="$(gh api "repos/$tool_repo/actions/runs/$run_id/artifacts" \
+    --jq '.artifacts[0].name' 2>/dev/null || true)"
+  [ -n "$artifact" ] || die "no artifact on this run"
+
+  info "downloading $artifact"
+  gh run download "$run_id" --repo "$tool_repo" --name "$artifact" \
+    --dir "$work/out" >/dev/null
+
+  local apk; apk="$(find "$work/out" -name '*.apk' -type f | head -1)"
+  [ -n "$apk" ] || die "artifact contained no APK"
+
+  local dest="$DOWNLOAD_DIR/${name}-${variant}.apk"
+  mv "$apk" "$dest"
+  info "APK: $dest ($(du -h "$dest" | cut -f1))"
+
+  cleanup
+  trap 'rm -rf "$work"' EXIT
+
+  printf '%s\n' "$dest"
+}
+
+load_config
+
+case "${1:-}" in
+  build) shift; cmd_build "$@" ;;
+  ""|-h|--help) sed -n '2,12p' "$0" ;;
+  *) die "unknown command: $1" ;;
+esac

@@ -231,61 +231,100 @@ jobs:
           echo "cargo build ${args[*]:-}"
           cargo build "${args[@]}"
 
-          # Determine where cargo put the artifacts.
+          # Record where artifacts land. A crate can put output in the
+          # triple-qualified directory or in target/ directly depending on
+          # whether --target was passed, so record both and let the collect
+          # step search rather than guessing.
           host=$(rustc -vV | sed -n 's/^host: //p')
           triple="${TARGET:-$host}"
-          outdir="target/${triple}/$( [ "$PROFILE" = release ] && echo release || echo debug )"
-          echo "outdir=$outdir" >> "$GITHUB_OUTPUT"
-          ls -l "$outdir" | head -30
+          subdir="$([ "$PROFILE" = release ] && echo release || echo debug)"
+          echo "triple=$triple" >> "$GITHUB_OUTPUT"
+          echo "subdir=$subdir" >> "$GITHUB_OUTPUT"
+          echo "built; looking for artifacts under target/"
 
       - name: Collect artifacts
         id: pack
         working-directory: src
         env:
           ROOT: ${{ steps.crate.outputs.root }}
-          OUTDIR: ${{ steps.crate.outputs.outdir }}
+          TRIPLE: ${{ steps.build.outputs.triple }}
+          SUBDIR: ${{ steps.build.outputs.subdir }}
           RAW: ${{ steps.params.outputs.raw }}
           PROJECT: ${{ steps.params.outputs.project }}
         run: |
           set -euo pipefail
+          cd "$ROOT"
           mkdir -p dist
-          shopt -s nullglob
-          bins=()
-          while IFS= read -r -d '' f; do bins+=("$f"); done \
-            < <(find "$ROOT/$OUTDIR" -maxdepth 1 -type f -executable ! -name '*.d' -print0)
 
-          if [ ${#bins[@]} -eq 0 ]; then
-            echo "::error::No executables produced in $ROOT/$OUTDIR"
-            find "$ROOT/target" -type f -executable -name '*' | head -20 || true
+          # Cargo writes to target/<triple>/<profile> when --target is used and
+          # to target/<profile> when it is not. Search both.
+          dirs=("target/${TRIPLE}/${SUBDIR}" "target/${SUBDIR}" "target/${TRIPLE}" "target")
+          found=0
+          for d in "${dirs[@]}"; do
+            [ -d "$d" ] && { found=1; break; }
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No target directory found after a successful build."
             exit 1
           fi
-          printf 'Found %d executable(s)\n' "${#bins[@]}"
+          echo "artifacts under: $d"
 
-          if [ "$RAW" = "true" ]; then
-            # Bare binaries, renamed with an extension so the artifact is obvious.
-            names=""
-            for b in "${bins[@]}"; do
-              base="$(basename "$b")"
-              cp "$b" "dist/${base}.bin"
-              names="$names ${base}.bin"
-            done
-            echo "mode=raw" >> "$GITHUB_OUTPUT"
-            echo "files=${names# }" >> "$GITHUB_OUTPUT"
-          else
-            mkdir -p dist/pkg
-            for b in "${bins[@]}"; do
-              cp "$b" "dist/pkg/$(basename "$b")"
-            done
-            # Ship the license and readme alongside the binaries when present.
-            for extra in README.md README LICENSE LICENSE-MIT LICENSE-APACHE COPYING; do
-              if [ -f "$ROOT/$extra" ]; then cp "$ROOT/$extra" dist/pkg/; fi
-            done
-            tar czf "dist/${PROJECT}.tar.gz" -C dist pkg
-            echo "mode=tarball" >> "$GITHUB_OUTPUT"
-            echo "files=${PROJECT}.tar.gz" >> "$GITHUB_OUTPUT"
+          shopt -s nullglob
+          bins=()
+          for cand in "$d" "target/${TRIPLE}/${SUBDIR}" "target/${SUBDIR}"; do
+            [ -d "$cand" ] || continue
+            while IFS= read -r -d '' f; do bins+=("$f"); done \
+              < <(find "$cand" -maxdepth 1 -type f -executable ! -name '*.d' -print0)
+            [ ${#bins[@]} -gt 0 ] && break
+          done
+
+          # A library crate has [lib] and no binaries. Its distributable output
+          # is the rlib plus the generated metadata, so fall back to those.
+          kind="bin"
+          if [ ${#bins[@]} -eq 0 ]; then
+            kind="lib"
+            while IFS= read -r -d '' f; do bins+=("$f"); done \
+              < <(find target -type f \( -name '*.rlib' -o -name '*.rmeta' \) -print0)
           fi
 
-          ls -l dist
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "::error::Build produced neither executables nor rlibs."
+            find target -maxdepth 3 -type f | head -30 || true
+            exit 1
+          fi
+          printf 'Found %d %s artifact(s)\n' "${#bins[@]}" "$kind"
+
+          names=""
+          for b in "${bins[@]}"; do
+            base="$(basename "$b")"
+            if [ "$kind" = "lib" ]; then
+              cp "$b" "dist/$base"
+            elif [ "$RAW" = "true" ]; then
+              # Bare binaries get a suffix so the artifact is self-describing.
+              cp "$b" "dist/${base}.bin"
+              base="${base}.bin"
+            else
+              mkdir -p dist/pkg
+              cp "$b" "dist/pkg/$base"
+            fi
+            names="$names $base"
+          done
+
+          if [ "$kind" = "lib" ]; then
+            echo "mode=lib" >> "$GITHUB_OUTPUT"
+          elif [ "$RAW" = "true" ]; then
+            echo "mode=raw" >> "$GITHUB_OUTPUT"
+          else
+            for extra in README.md README LICENSE LICENSE-MIT LICENSE-APACHE COPYING; do
+              if [ -f "$extra" ]; then cp "$extra" dist/pkg/; fi
+            done
+            tar czf "dist/${PROJECT}.tar.gz" -C dist pkg
+            names="${PROJECT}.tar.gz"
+            echo "mode=tarball" >> "$GITHUB_OUTPUT"
+          fi
+          echo "files=${names# }" >> "$GITHUB_OUTPUT"
+
+          ls -la dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

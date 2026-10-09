@@ -123,9 +123,12 @@ cmd_build() {
   info "uploading source to secret gist"
   # No --public flag: gists are secret by default and only visible to this
   # account unless explicitly published.
+  # gh writes its progress lines to stderr and only the URL to stdout, so
+  # capture stdout alone and let stderr pass through for the user.
   local gist_url
-  gist_url="$(gh gist create "$b64" 2>&1)" \
-    || die "gist upload failed: $gist_url"
+  if ! gist_url="$(gh gist create "$b64")"; then
+    die "gist upload failed"
+  fi
   local gist_id
   gist_id="$(printf '%s' "$gist_url" | sed -n 's#.*/gist/\([a-f0-9]*\).*#\1#p' | head -1)"
   [ -n "$gist_id" ] || die "could not determine gist id from: $gist_url"

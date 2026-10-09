@@ -52,7 +52,9 @@ package_project() {
     fi
     # -C keeps paths relative to the repo root inside the tarball.
     if git -C "$dir" ls-files --error-unmatch . >/dev/null 2>&1; then
-      git -C "$dir" archive --format=tar HEAD -o "$dest" 2>/dev/null && return 0
+      # tar.gz, not tar: the build workflows extract with 'tar xzf' and a
+      # plain tar silently fails to decompress.
+      git -C "$dir" archive --format=tar.gz HEAD -o "$dest" 2>/dev/null && return 0
       info "git archive failed, falling back to tar"
     fi
   fi

@@ -183,7 +183,11 @@ cmd_build() {
 
   local workflow="android.yml"
   local event_type="build"
-  local artifact_name=""
+
+  # Recorded before dispatch so a previously finished run cannot be mistaken
+  # for this one when the run list is polled.
+  local after_epoch
+  after_epoch="$(date -u -d '1 minute ago' +%s 2>/dev/null || date -u +%s)"
 
   if [ "$lang" = "rust" ]; then
     workflow="rust.yml"
@@ -213,14 +217,15 @@ cmd_build() {
 
   info "waiting for run to start"
   local run_id=""
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 45); do
     sleep 2
     run_id="$(gh run list --repo "$tool_repo" --workflow "$workflow" \
-      --event repository_dispatch --limit 1 \
-      --json databaseId,status --jq '.[0].databaseId // empty' 2>/dev/null || true)"
+      --event repository_dispatch --limit 5 --json databaseId,createdAt \
+      --jq "[.[] | select((.createdAt | fromdate) > $after_epoch)][0].databaseId // empty" \
+      2>/dev/null || true)"
     [ -n "$run_id" ] && break
   done
-  [ -n "$run_id" ] || die "no run appeared within 60s"
+  [ -n "$run_id" ] || die "no new run appeared within 90s. Check: gh run list --repo $tool_repo --workflow $workflow"
 
   info "run $run_id"
   if ! gh run watch "$run_id" --repo "$tool_repo" --exit-status; then

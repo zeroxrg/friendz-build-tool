@@ -170,7 +170,10 @@ cmd_build() {
     die "gist upload failed"
   fi
   local gist_id
-  gist_id="$(printf '%s' "$gist_url" | sed -n 's#.*/gist/\([a-f0-9]*\).*#\1#p' | head -1)"
+  # Gist IDs are long hex strings. Matching on the trailing path segment is
+  # safer than matching "/gist/" because the canonical URL is
+  # https://gist.github.com/<user>/<id>, where the host itself contains "gist".
+  gist_id="$(printf '%s' "$gist_url" | grep -oE '[a-f0-9]{20,}$' | head -1)"
   [ -n "$gist_id" ] || die "could not determine gist id from: $gist_url"
   info "gist $gist_id"
 

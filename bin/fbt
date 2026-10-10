@@ -664,12 +664,15 @@ cmd_build() {
     dest="${moved[0]}"
   elif [ "$lang" = "go" ]; then
     # The workflow uploads dist/ holding the single binary the module root
-    # produced, named after the last element of the module path.
+    # produced, named after the last element of the module path. A cross build
+    # gets the target in the filename, or it would overwrite the host binary.
+    local suffix=""
+    { [ -n "$goos" ] || [ -n "$goarch" ]; } && suffix="-${goos:-host}-${goarch:-host}"
     mapfile -t files < <(find "$work/out" -type f | sort)
     [ ${#files[@]} -gt 0 ] || die "artifact contained no build output"
     local moved=()
     for f in "${files[@]}"; do
-      dest="$DOWNLOAD_DIR/$(basename "$f")"
+      dest="$DOWNLOAD_DIR/$(basename "$f")$suffix"
       mv "$f" "$dest"
       moved+=("$dest")
     done

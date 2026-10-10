@@ -1,7 +1,7 @@
 # fbt
 
-Build Android, Rust, and Go projects on GitHub-hosted runners, without
-installing a local JDK, Android SDK, Rust, or Go toolchain.
+Build Android, Rust, Go, and .NET projects on GitHub-hosted runners, without
+installing a local JDK, Android SDK, Rust, Go, or .NET toolchain.
 
 Source is packaged into a secret gist, built on a runner, and the output lands
 in a local downloads directory. The gist is deleted after every run, whether
@@ -18,6 +18,7 @@ in its public event archive.
 | Android | `android.yml` | `.apk` |
 | Rust | `rust.yml` | tarball, `.rlib`, or native library, depending on crate type |
 | Go | `go.yml` | Go binary, host or `GOOS`/`GOARCH` cross-compiled |
+| .NET | `dotnet.yml` | tarball of `dotnet publish` output |
 
 ### Android
 
@@ -62,6 +63,20 @@ pure-Go binary and only the target platform changes. A module whose root is
 not a `main` package has no binary to upload, and the build fails with that
 message rather than an empty artifact.
 
+### .NET
+
+Uses the .NET 10 SDK via `actions/setup-dotnet`, with an `actions/cache`
+entry covering the NuGet package cache, keyed on the project's `*.csproj`
+files. The build target is the `.sln` at the archive root, falling back to a
+`.csproj` and then to one level down, so both a single project and a solution
+layout work. Output is a tarball of `dotnet publish` named
+`<project>-<configuration>[-<runtime>].tar.gz`.
+
+`--runtime` takes a runtime identifier such as `linux-x64` or `win-x64` and
+produces a self-contained publish for that platform. C# is the language; .NET
+is the SDK and runtime that compiles it, so this pipeline builds any .NET
+project regardless of language, though C# is the usual case.
+
 ## Usage
 
 ```bash
@@ -100,6 +115,15 @@ fbt build ./my-cmd --go                       # host build
 fbt build ./my-cmd --go --goos darwin --goarch arm64
 fbt build ./my-cmd --go --goos windows --goarch amd64
 fbt build ./my-cmd --go --tests               # go test ./..., then build
+```
+
+.NET:
+
+```bash
+fbt build ./my-app --dotnet                         # Release publish (default)
+fbt build ./my-app --dotnet --configuration Debug
+fbt build ./my-app --dotnet --runtime win-x64       # self-contained for Windows
+fbt build ./my-app --dotnet --tests                 # dotnet test, then publish
 ```
 
 Run `fbt build --help` for the full flag list.

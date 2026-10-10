@@ -210,6 +210,12 @@ Go (--go):
   --goarch NAME      GOARCH, e.g. amd64, arm64 (default: host)
   --tests            run go test ./... before building
 
+.NET (--dotnet):
+  --configuration NAME
+                     Release | Debug              (default: Release)
+  --runtime RID      e.g. linux-x64, win-x64      (default: host)
+  --tests            run dotnet test before publishing
+
 Release signing, one-time setup:
   fbt keygen         create ~/.config/fbt/release.p12 and signing.env
   fbt key push       store it as a secret on the tool repo
@@ -221,6 +227,8 @@ Examples:
   fbt build ./my-crate --rust --tests
   fbt build ./my-cmd --go
   fbt build ./my-cmd --go --goos windows --goarch amd64
+  fbt build ./my-app --dotnet
+  fbt build ./my-app --dotnet --runtime linux-x64 --tests
 USAGE
 }
 
@@ -470,6 +478,8 @@ cmd_build() {
   local raw="false"
   local goos=""
   local goarch=""
+  local configuration="Release"
+  local runtime=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -480,10 +490,13 @@ cmd_build() {
       --no-sign) signed="false"; shift ;;
       --rust)    lang="rust"; shift ;;
       --go)      lang="go"; shift ;;
+      --dotnet)  lang="dotnet"; shift ;;
       --profile) profile="${2:-}"; shift 2 ;;
       --target)  target="${2:-}"; shift 2 ;;
       --goos)    goos="${2:-}"; shift 2 ;;
       --goarch)  goarch="${2:-}"; shift 2 ;;
+      --configuration) configuration="${2:-}"; shift 2 ;;
+      --runtime) runtime="${2:-}"; shift 2 ;;
       --features) features="${2:-}"; shift 2 ;;
       --all-features) all_features="true"; shift ;;
       --no-default-features) no_default_features="true"; shift ;;
@@ -512,6 +525,13 @@ cmd_build() {
     ''|386|amd64|arm|arm64|loong64|mips|mipsle|mips64|mips64le|ppc64|ppc64le|riscv64|s390x|wasm) ;;
     *) die "unknown --goarch: $goarch" ;;
   esac
+  case "$configuration" in
+    Release|Debug) ;;
+    *) die "--configuration must be Release or Debug, got '$configuration'" ;;
+  esac
+  if [ -n "$runtime" ] && ! printf '%s' "$runtime" | grep -Eq '^[a-z]+-[a-z0-9]+$'; then
+    die "invalid --runtime: '$runtime'. Expect a runtime identifier like linux-x64."
+  fi
 
   [ -d "$dir" ] || die "not a directory: $dir"
   dir="$(cd "$dir" && pwd)"
@@ -607,6 +627,18 @@ cmd_build() {
       -f "client_payload[goarch]=$goarch" \
       -f "client_payload[run_tests]=$run_tests" >/dev/null \
       || die "dispatch failed"
+  elif [ "$lang" = "dotnet" ]; then
+    workflow="dotnet.yml"
+    event_type="dotnet"
+    info "dispatching dotnet build: configuration=$configuration runtime=${runtime:-host} tests=$run_tests"
+    gh api "repos/$tool_repo/dispatches" \
+      -f "event_type=$event_type" \
+      -F "client_payload[project]=$name" \
+      -f "client_payload[gist_id]=$gist_id" \
+      -f "client_payload[configuration]=$configuration" \
+      -f "client_payload[runtime]=$runtime" \
+      -f "client_payload[run_tests]=$run_tests" >/dev/null \
+      || die "dispatch failed"
   else
     info "dispatching android build: variant=$variant signed=$signed"
     gh api "repos/$tool_repo/dispatches" \
@@ -678,6 +710,21 @@ cmd_build() {
     done
     for d in "${moved[@]}"; do
       info "binary: $d ($(du -h "$d" | cut -f1))"
+    done
+    dest="${moved[0]}"
+  elif [ "$lang" = "dotnet" ]; then
+    # The workflow uploads dist/ holding one tarball of the publish output,
+    # named <project>-<configuration>[-<runtime>].tar.gz.
+    mapfile -t files < <(find "$work/out" -type f -name '*.tar.gz' | sort)
+    [ ${#files[@]} -gt 0 ] || die "artifact contained no build output"
+    local moved=()
+    for f in "${files[@]}"; do
+      dest="$DOWNLOAD_DIR/$(basename "$f")"
+      mv "$f" "$dest"
+      moved+=("$dest")
+    done
+    for d in "${moved[@]}"; do
+      info "artifact: $d ($(du -h "$d" | cut -f1))"
     done
     dest="${moved[0]}"
   else

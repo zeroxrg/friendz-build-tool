@@ -1,7 +1,7 @@
 # fbt
 
-Build Android and Rust projects on GitHub-hosted runners, without installing a
-local JDK, Android SDK, or Rust toolchain.
+Build Android, Rust, and Go projects on GitHub-hosted runners, without
+installing a local JDK, Android SDK, Rust, or Go toolchain.
 
 Source is packaged into a secret gist, built on a runner, and the output lands
 in a local downloads directory. The gist is deleted after every run, whether
@@ -17,6 +17,7 @@ in its public event archive.
 |---|---|---|
 | Android | `android.yml` | `.apk` |
 | Rust | `rust.yml` | tarball, `.rlib`, or native library, depending on crate type |
+| Go | `go.yml` | Go binary, host or `GOOS`/`GOARCH` cross-compiled |
 
 ### Android
 
@@ -45,6 +46,21 @@ Artifact collection inspects what the build actually produced:
 
 Libraries are filtered to the crate's own artifacts by matching the crate name
 from `Cargo.toml`, so a build does not return every transitive dependency.
+
+### Go
+
+Uses the stable toolchain via `actions/setup-go`, with an `actions/cache`
+entry covering the module cache and the Go build cache, keyed on `go.mod` or
+`go.sum`. The module root is found at the archive root or one level down, so
+both a single module and a directory of modules work. The binary is named
+after the last element of the module path in `go.mod`, which is the name
+`go build` would pick on its own, and is uploaded bare.
+
+`--goos` and `--goarch` cross-compile. Unlike Rust, this needs no extra
+toolchain: the build runs with `CGO_ENABLED=0`, so the output is a static
+pure-Go binary and only the target platform changes. A module whose root is
+not a `main` package has no binary to upload, and the build fails with that
+message rather than an empty artifact.
 
 ## Usage
 
@@ -75,6 +91,15 @@ fbt build ./my-crate --rust --features foo,bar
 fbt build ./my-crate --rust --all-features
 fbt build ./my-crate --rust --no-default-features
 fbt build ./my-crate --rust --raw                 # bare binaries instead of tarball
+```
+
+Go:
+
+```bash
+fbt build ./my-cmd --go                       # host build
+fbt build ./my-cmd --go --goos darwin --goarch arm64
+fbt build ./my-cmd --go --goos windows --goarch amd64
+fbt build ./my-cmd --go --tests               # go test ./..., then build
 ```
 
 Run `fbt build --help` for the full flag list.
@@ -211,6 +236,13 @@ Release signing adds four more secrets. `fbt key push` sets all of them; see
 - **Host Rust targets only.** Cross-compiling to `*-linux-android` targets
   needs the NDK and a configured linker. `--target` passes the triple through,
   but only host builds are exercised.
+- **Go cross-compilation is pure Go.** `CGO_ENABLED=0` is always set, so a
+  cross-compiled binary needs no cross toolchain, but a package that requires
+  cgo will not build. Tests always run for the host, before any target
+  selection applies.
+- **Go builds the module root only.** A repository of several `main` packages
+  is packaged down to the first `go.mod` found one level below the archive
+  root; point `fbt` at the specific command's directory to build that one.
 - **No `pull_request` or `pull_request_target` triggers.** Anyone can open a
   pull request on a public repository, and those triggers run with repository
   secrets and a write-scoped token. Builds are dispatched only by

@@ -1,0 +1,249 @@
+name: go
+
+on:
+  repository_dispatch:
+    types: [go]
+  workflow_call:
+    inputs:
+      gist_id:
+        description: 'ID of the secret gist holding src.tar.gz.b64'
+        required: true
+        type: string
+      project:
+        description: 'Project name, used for artifact naming'
+        required: false
+        type: string
+        default: 'app'
+      goos:
+        description: 'GOOS. Empty means host default.'
+        required: false
+        type: string
+        default: ''
+      goarch:
+        description: 'GOARCH. Empty means host default.'
+        required: false
+        type: string
+        default: ''
+      run_tests:
+        description: 'Run go test ./... before building'
+        required: false
+        type: string
+        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-${{ github.event.client_payload.gist_id || inputs.gist_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Resolve inputs
+        id: params
+        env:
+          EV_GIST: ${{ github.event.client_payload.gist_id }}
+          EV_PROJECT: ${{ github.event.client_payload.project }}
+          EV_GOOS: ${{ github.event.client_payload.goos }}
+          EV_GOARCH: ${{ github.event.client_payload.goarch }}
+          EV_TESTS: ${{ github.event.client_payload.run_tests }}
+          IN_GIST: ${{ inputs.gist_id }}
+          IN_PROJECT: ${{ inputs.project }}
+          IN_GOOS: ${{ inputs.goos }}
+          IN_GOARCH: ${{ inputs.goarch }}
+          IN_TESTS: ${{ inputs.run_tests }}
+        run: |
+          set -euo pipefail
+          pick() {
+            if [ -n "$1" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+          }
+          {
+            echo "gist=$(pick "$EV_GIST" "$IN_GIST")"
+            echo "project=$(pick "$EV_PROJECT" "$IN_PROJECT")"
+            echo "goos=$(pick "$EV_GOOS" "$IN_GOOS")"
+            echo "goarch=$(pick "$EV_GOARCH" "$IN_GOARCH")"
+            echo "tests=$(pick "$EV_TESTS" "$IN_TESTS")"
+          } >> "$GITHUB_OUTPUT"
+          echo "project=${{ steps.params.outputs.project }} goos=${{ steps.params.outputs.goos }} goarch=${{ steps.params.outputs.goarch }} tests=${{ steps.params.outputs.tests }}"
+
+      - name: Validate inputs
+        env:
+          GOOS: ${{ steps.params.outputs.goos }}
+          GOARCH: ${{ steps.params.outputs.goarch }}
+          TESTS: ${{ steps.params.outputs.tests }}
+        run: |
+          set -euo pipefail
+          if [ -n "$GOOS" ] && ! printf '%s' "$GOOS" | grep -Eq '^[a-z0-9]+$'; then
+            echo "::error::invalid goos: '$GOOS'"
+            exit 1
+          fi
+          if [ -n "$GOARCH" ] && ! printf '%s' "$GOARCH" | grep -Eq '^[a-z0-9]+$'; then
+            echo "::error::invalid goarch: '$GOARCH'"
+            exit 1
+          fi
+          case "$TESTS" in
+            true|false) ;;
+            *) echo "::error::tests must be true or false, got '$TESTS'"; exit 1 ;;
+          esac
+          echo "inputs ok"
+
+      - name: Fetch source from secret gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ steps.params.outputs.gist }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GIST_TOKEN" ]; then
+            echo "::error::GIST_TOKEN secret is not set on this repository."
+            exit 1
+          fi
+          if [ -z "$GIST_ID" ]; then
+            echo "::error::No gist id supplied."
+            exit 1
+          fi
+          url=$(GH_TOKEN="$GIST_TOKEN" gh api "gists/$GIST_ID" \
+            --jq '.files["src.tar.gz.b64"].raw_url // .files["src.tar.gz"].raw_url')
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "::error::Gist $GIST_ID has no src.tar.gz.b64 file."
+            exit 1
+          fi
+          curl -fsSL -H "Authorization: Bearer $GIST_TOKEN" "$url" -o src.b64
+          base64 -d src.b64 > src.tar.gz
+          rm -f src.b64
+          ls -l src.tar.gz
+
+      - name: Extract source
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          tar xzf src.tar.gz -C src
+          rm -f src.tar.gz
+          ls -A src
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Locate module root
+        id: module
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ -f go.mod ]; then
+            root="."
+          else
+            root="$(find . -maxdepth 2 -name go.mod -type f -printf '%h\n' | head -1)"
+          fi
+          if [ -z "$root" ]; then
+            echo "::error::No go.mod found in the uploaded source."
+            exit 1
+          fi
+          if [ -f "$root/go.sum" ]; then
+            hash="$(sha256sum "$root/go.sum" | cut -c1-16)"
+          else
+            hash="$(sha256sum "$root/go.mod" | cut -c1-16)"
+          fi
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "module root: $root"
+
+      - name: Cache modules and build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ steps.params.outputs.project }}-${{ steps.module.outputs.hash }}
+          restore-keys: |
+            go-${{ steps.params.outputs.project }}-
+            go-
+
+      - name: Run tests
+        if: steps.params.outputs.tests == 'true'
+        working-directory: src
+        env:
+          ROOT: ${{ steps.module.outputs.root }}
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
+          go test ./...
+
+      - name: Build
+        id: build
+        working-directory: src
+        env:
+          ROOT: ${{ steps.module.outputs.root }}
+          GOOS: ${{ steps.params.outputs.goos }}
+          GOARCH: ${{ steps.params.outputs.goarch }}
+          PROJECT: ${{ steps.params.outputs.project }}
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
+
+          [ -n "$GOOS" ] || unset GOOS
+          [ -n "$GOARCH" ] || unset GOARCH
+
+          dist="$GITHUB_WORKSPACE/src/dist"
+          mkdir -p "$dist"
+
+          mod="$(awk '$1 == "module" { print $2; exit }' go.mod)"
+          name="${mod##*/}"
+          [ -n "$name" ] || name="$PROJECT"
+
+          export CGO_ENABLED=0
+
+          echo "go build ${GOOS:+GOOS=$GOOS }${GOARCH:+GOARCH=$GOARCH }-o dist/$name"
+          go build -o "$dist/$name" .
+
+          if [ ! -x "$dist/$name" ]; then
+            echo "::error::$ROOT has no main package: nothing executable to upload."
+            exit 1
+          fi
+
+          echo "bin=$name" >> "$GITHUB_OUTPUT"
+          ls -l "$dist"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-${{ steps.params.outputs.project }}-${{ steps.params.outputs.goos || 'host' }}-${{ steps.params.outputs.goarch || 'host' }}
+          path: src/dist
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Delete source gist
+        if: always()
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ steps.params.outputs.gist }}
+        run: |
+          if [ -z "$GIST_TOKEN" ] || [ -z "$GIST_ID" ]; then
+            echo "Nothing to clean up."
+            exit 0
+          fi
+          if GH_TOKEN="$GIST_TOKEN" gh api -X DELETE "gists/$GIST_ID" 2>/dev/null; then
+            echo "Deleted source gist $GIST_ID"
+          else
+            echo "::warning::Could not delete gist $GIST_ID. Remove it manually."
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          PROJECT: ${{ steps.params.outputs.project }}
+          GOOS: ${{ steps.params.outputs.goos }}
+          GOARCH: ${{ steps.params.outputs.goarch }}
+          BIN: ${{ steps.build.outputs.bin }}
+        run: |
+          {
+            echo "### fbt go build"
+            echo "- project: \`$PROJECT\`"
+            echo "- goos: \`${GOOS:-host}\`"
+            echo "- goarch: \`${GOARCH:-host}\`"
+            echo "- binary: \`${BIN:-none}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

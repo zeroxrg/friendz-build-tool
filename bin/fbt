@@ -205,6 +205,11 @@ Rust (--rust):
   --tests            run cargo test before building
   --raw              upload bare binaries instead of a tarball
 
+Go (--go):
+  --goos NAME        GOOS, e.g. linux, darwin (default: host)
+  --goarch NAME      GOARCH, e.g. amd64, arm64 (default: host)
+  --tests            run go test ./... before building
+
 Release signing, one-time setup:
   fbt keygen         create ~/.config/fbt/release.p12 and signing.env
   fbt key push       store it as a secret on the tool repo
@@ -214,6 +219,8 @@ Examples:
   fbt build ./my-android-app
   fbt build ./my-android-app --release
   fbt build ./my-crate --rust --tests
+  fbt build ./my-cmd --go
+  fbt build ./my-cmd --go --goos windows --goarch amd64
 USAGE
 }
 
@@ -461,6 +468,8 @@ cmd_build() {
   local no_default_features="false"
   local run_tests="false"
   local raw="false"
+  local goos=""
+  local goarch=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -470,8 +479,11 @@ cmd_build() {
       --sign)    signed="true"; shift ;;
       --no-sign) signed="false"; shift ;;
       --rust)    lang="rust"; shift ;;
+      --go)      lang="go"; shift ;;
       --profile) profile="${2:-}"; shift 2 ;;
       --target)  target="${2:-}"; shift 2 ;;
+      --goos)    goos="${2:-}"; shift 2 ;;
+      --goarch)  goarch="${2:-}"; shift 2 ;;
       --features) features="${2:-}"; shift 2 ;;
       --all-features) all_features="true"; shift ;;
       --no-default-features) no_default_features="true"; shift ;;
@@ -488,6 +500,18 @@ cmd_build() {
   # does not cost a gist and a delete.
   [ "$signed" = "false" ] || [ "$lang" = "android" ] \
     || die "--release and --sign are Android-only. Rust builds use --profile release, which is already the default."
+
+  # Allowlisted rather than shape-checked: a typo here costs a gist and a
+  # runner minute to discover, and the values the go tool accepts are a small,
+  # stable set.
+  case "$goos" in
+    ''|aix|android|darwin|dragonfly|freebsd|illumos|ios|js|linux|netbsd|openbsd|plan9|solaris|wasip1|windows|zos) ;;
+    *) die "unknown --goos: $goos" ;;
+  esac
+  case "$goarch" in
+    ''|386|amd64|arm|arm64|loong64|mips|mipsle|mips64|mips64le|ppc64|ppc64le|riscv64|s390x|wasm) ;;
+    *) die "unknown --goarch: $goarch" ;;
+  esac
 
   [ -d "$dir" ] || die "not a directory: $dir"
   dir="$(cd "$dir" && pwd)"
@@ -571,6 +595,18 @@ cmd_build() {
       -f "client_payload[run_tests]=$run_tests" \
       -f "client_payload[raw]=$raw" >/dev/null \
       || die "dispatch failed"
+  elif [ "$lang" = "go" ]; then
+    workflow="go.yml"
+    event_type="go"
+    info "dispatching go build: goos=${goos:-host} goarch=${goarch:-host} tests=$run_tests"
+    gh api "repos/$tool_repo/dispatches" \
+      -f "event_type=$event_type" \
+      -F "client_payload[project]=$name" \
+      -f "client_payload[gist_id]=$gist_id" \
+      -f "client_payload[goos]=$goos" \
+      -f "client_payload[goarch]=$goarch" \
+      -f "client_payload[run_tests]=$run_tests" >/dev/null \
+      || die "dispatch failed"
   else
     info "dispatching android build: variant=$variant signed=$signed"
     gh api "repos/$tool_repo/dispatches" \
@@ -624,6 +660,21 @@ cmd_build() {
     done
     for d in "${moved[@]}"; do
       info "artifact: $d ($(du -h "$d" | cut -f1))"
+    done
+    dest="${moved[0]}"
+  elif [ "$lang" = "go" ]; then
+    # The workflow uploads dist/ holding the single binary the module root
+    # produced, named after the last element of the module path.
+    mapfile -t files < <(find "$work/out" -type f | sort)
+    [ ${#files[@]} -gt 0 ] || die "artifact contained no build output"
+    local moved=()
+    for f in "${files[@]}"; do
+      dest="$DOWNLOAD_DIR/$(basename "$f")"
+      mv "$f" "$dest"
+      moved+=("$dest")
+    done
+    for d in "${moved[@]}"; do
+      info "binary: $d ($(du -h "$d" | cut -f1))"
     done
     dest="${moved[0]}"
   else

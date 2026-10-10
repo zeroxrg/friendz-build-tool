@@ -24,6 +24,16 @@ on:
         required: false
         type: string
         default: 'false'
+      native:
+        description: 'Rust crate dir (relative to the source root) to cross-compile for Android into jniLibs; empty skips'
+        required: false
+        type: string
+        default: ''
+      abis:
+        description: 'Comma-separated Android ABIs for the native crate'
+        required: false
+        type: string
+        default: 'arm64-v8a'
 
 permissions:
   contents: read
@@ -35,7 +45,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Resolve inputs
@@ -45,10 +55,14 @@ jobs:
           EV_PROJECT: ${{ github.event.client_payload.project }}
           EV_VARIANT: ${{ github.event.client_payload.variant }}
           EV_SIGNED: ${{ github.event.client_payload.signed }}
+          EV_NATIVE: ${{ github.event.client_payload.native }}
+          EV_ABIS: ${{ github.event.client_payload.abis }}
           IN_GIST: ${{ inputs.gist_id }}
           IN_PROJECT: ${{ inputs.project }}
           IN_VARIANT: ${{ inputs.variant }}
           IN_SIGNED: ${{ inputs.signed }}
+          IN_NATIVE: ${{ inputs.native }}
+          IN_ABIS: ${{ inputs.abis }}
         run: |
           set -euo pipefail
           pick() {
@@ -59,13 +73,17 @@ jobs:
             echo "project=$(pick "$EV_PROJECT" "$IN_PROJECT")"
             echo "variant=$(pick "$EV_VARIANT" "$IN_VARIANT")"
             echo "signed=$(pick "$EV_SIGNED" "$IN_SIGNED")"
+            echo "native=$(pick "$EV_NATIVE" "$IN_NATIVE")"
+            echo "abis=$(pick "$EV_ABIS" "$IN_ABIS")"
           } >> "$GITHUB_OUTPUT"
-          echo "project=${{ steps.params.outputs.project }} variant=${{ steps.params.outputs.variant }} signed=${{ steps.params.outputs.signed }}"
+          echo "project=${{ steps.params.outputs.project }} variant=${{ steps.params.outputs.variant }} signed=${{ steps.params.outputs.signed }} native=${{ steps.params.outputs.native }} abis=${{ steps.params.outputs.abis }}"
 
       - name: Validate inputs
         env:
           VARIANT: ${{ steps.params.outputs.variant }}
           SIGNED: ${{ steps.params.outputs.signed }}
+          NATIVE: ${{ steps.params.outputs.native }}
+          ABIS: ${{ steps.params.outputs.abis }}
         run: |
           set -euo pipefail
           # The variant becomes a Gradle task name, so it is held to what a task
@@ -78,6 +96,27 @@ jobs:
             true|false) ;;
             *) echo "::error::signed must be true or false, got '$SIGNED'"; exit 1 ;;
           esac
+          # The native crate dir is joined to the extracted source root, so it
+          # must stay relative and inside the tree; ABIs come from a fixed set.
+          if [ -n "$NATIVE" ]; then
+            case "$NATIVE" in
+              /*|*..*) echo "::error::invalid native crate dir"; exit 1 ;;
+            esac
+            if ! printf '%s' "$NATIVE" | grep -Eq '^[A-Za-z0-9_./-]+$'; then
+              echo "::error::invalid native crate dir"
+              exit 1
+            fi
+          fi
+          if ! printf '%s' "$ABIS" | grep -Eq '^[A-Za-z0-9_,-]+$'; then
+            echo "::error::invalid abis"
+            exit 1
+          fi
+          for _abi in $(printf '%s' "$ABIS" | tr ',' ' '); do
+            case "$_abi" in
+              arm64-v8a|armeabi-v7a|x86_64|x86) ;;
+              *) echo "::error::unsupported ABI '$_abi'"; exit 1 ;;
+            esac
+          done
           echo "inputs ok"
 
       - name: Fetch source from secret gist
@@ -128,6 +167,79 @@ jobs:
       # After the JDK step: reading the certificate back out of the keystore
       # needs keytool, and the fingerprint it yields is what the finished APK is
       # checked against.
+      - name: Set up Rust for Android targets
+        if: steps.params.outputs.native != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Cache cargo registry
+        if: steps.params.outputs.native != ''
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-ndk-${{ steps.params.outputs.project }}-${{ hashFiles('src/Cargo.lock', 'src/**/Cargo.lock') }}
+          restore-keys: |
+            cargo-ndk-${{ steps.params.outputs.project }}-
+
+      # Optional Rust companion: cross-compile one crate for the requested
+      # ABIs with cargo-ndk and stage each lib*.so into the app module's
+      # jniLibs, so the Gradle build picks it up with no project changes.
+      # Only the crate's own cdylib artifacts are staged, matched by the
+      # crate name from its Cargo.toml.
+      - name: Build Rust native libs
+        if: steps.params.outputs.native != ''
+        working-directory: src
+        env:
+          NATIVE: ${{ steps.params.outputs.native }}
+          ABIS: ${{ steps.params.outputs.abis }}
+        run: |
+          set -euo pipefail
+          [ -f "$NATIVE/Cargo.toml" ] || { echo "::error::no Cargo.toml under '$NATIVE'"; exit 1; }
+          for _abi in $(printf '%s' "$ABIS" | tr ',' ' '); do
+            case "$_abi" in
+              arm64-v8a|armeabi-v7a|x86_64|x86) ;;
+              *) echo "::error::unsupported ABI '$_abi'"; exit 1 ;;
+            esac
+          done
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          ndk_ver="28.2.13676358"
+          "$sdk/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_ver" >/dev/null
+          export ANDROID_NDK_HOME="$sdk/ndk/$ndk_ver"
+          cargo install cargo-ndk --locked --quiet
+          manifest="$(find . -maxdepth 4 -path '*/src/main/AndroidManifest.xml' | head -1)"
+          [ -n "$manifest" ] || { echo "::error::no app module (src/main/AndroidManifest.xml) found"; exit 1; }
+          # manifest ./<mod>/src/main/AndroidManifest.xml -> module jniLibs dir
+          mod_dir="$(dirname "$(dirname "$(dirname "$manifest")")")"
+          dest="$mod_dir/src/main/jniLibs"
+          crate="$(awk -F'"' '/^name *=/ { print $2; exit }' "$NATIVE/Cargo.toml")"
+          [ -n "$crate" ] || { echo "::error::could not read crate name from $NATIVE/Cargo.toml"; exit 1; }
+          lib="$(printf '%s' "$crate" | tr '-' '_')"
+          triple_for() {
+            case "$1" in
+              arm64-v8a) printf aarch64-linux-android ;;
+              armeabi-v7a) printf armv7-linux-androideabi ;;
+              x86_64) printf x86_64-linux-android ;;
+              x86) printf i686-linux-android ;;
+            esac
+          }
+          tflags="$(printf '%s' "$ABIS" | sed 's/^/-t /; s/,/ -t /g')"
+          # Artifacts stay under target/<triple>/release and are collected
+          # below; no -o flag so nothing depends on cargo-ndk output layout.
+          # shellcheck disable=SC2086
+          (cd "$NATIVE" && cargo ndk $tflags --platform 28 build --release)
+          for _abi in $(printf '%s' "$ABIS" | tr ',' ' '); do
+            triple="$(triple_for "$_abi")"
+            src_so="$(find "$NATIVE/target/$triple/release" -maxdepth 1 -name "lib${lib}.so" | head -1)"
+            [ -n "$src_so" ] || { echo "::error::no lib${lib}.so for $triple"; exit 1; }
+            mkdir -p "$dest/$_abi"
+            cp "$src_so" "$dest/$_abi/"
+            echo "staged $dest/$_abi/lib${lib}.so"
+          done
+
       - name: Stage release signing key
         id: signing
         if: steps.params.outputs.signed == 'true'

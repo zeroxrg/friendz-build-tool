@@ -195,6 +195,10 @@ Android (default):
   --release          release variant, signed with the tool repo's release key
   --sign             sign the selected variant with the release key
   --no-sign          release variant, left unsigned
+  --native DIR       Rust crate dir (relative to the project) cross-compiled
+                     for Android and packaged into jniLibs (needs the NDK)
+  --abis LIST        comma-separated ABIs for --native
+                     (default: arm64-v8a; allowlist: arm64-v8a,armeabi-v7a,x86_64,x86)
 
 Rust (--rust):
   --profile NAME     release | dev            (default: release)
@@ -467,6 +471,8 @@ cmd_build() {
   local variant="debug"
   local signed="false"
   local tool_repo="$TOOL_REPO"
+  local native=""
+  local abis="arm64-v8a"
 
   local lang="android"
   local profile="release"
@@ -488,6 +494,8 @@ cmd_build() {
       --release) variant="release"; signed="true"; shift ;;
       --sign)    signed="true"; shift ;;
       --no-sign) signed="false"; shift ;;
+      --native)  native="${2:-}"; shift 2 ;;
+      --abis)    abis="${2:-}"; shift 2 ;;
       --rust)    lang="rust"; shift ;;
       --go)      lang="go"; shift ;;
       --dotnet)  lang="dotnet"; shift ;;
@@ -513,6 +521,8 @@ cmd_build() {
   # does not cost a gist and a delete.
   [ "$signed" = "false" ] || [ "$lang" = "android" ] \
     || die "--release and --sign are Android-only. Rust builds use --profile release, which is already the default."
+  [ -z "$native" ] || [ "$lang" = "android" ] \
+    || die "--native and --abis are Android-only."
 
   # Allowlisted rather than shape-checked: a typo here costs a gist and a
   # runner minute to discover, and the values the go tool accepts are a small,
@@ -529,6 +539,25 @@ cmd_build() {
     Release|Debug) ;;
     *) die "--configuration must be Release or Debug, got '$configuration'" ;;
   esac
+  # A relative crate dir inside the project; the runner joins it to the
+  # extracted source root, so anything absolute or parent-climbing is refused.
+  if [ -n "$native" ]; then
+    case "$native" in
+      /*|*..*) die "invalid --native: '$native'. Expect a relative crate dir like rust/app." ;;
+    esac
+    if ! printf '%s' "$native" | grep -Eq '^[A-Za-z0-9_./-]+$'; then
+      die "invalid --native: '$native'. Expect a relative crate dir like rust/app."
+    fi
+  fi
+  if ! printf '%s' "$abis" | grep -Eq '^[A-Za-z0-9_,-]+$'; then
+    die "invalid --abis: '$abis'."
+  fi
+  for _abi in $(printf '%s' "$abis" | tr ',' ' '); do
+    case "$_abi" in
+      arm64-v8a|armeabi-v7a|x86_64|x86) ;;
+      *) die "unknown ABI in --abis: '$_abi'. Allowlist: arm64-v8a,armeabi-v7a,x86_64,x86." ;;
+    esac
+  done
   if [ -n "$runtime" ] && ! printf '%s' "$runtime" | grep -Eq '^[a-z]+-[a-z0-9]+$'; then
     die "invalid --runtime: '$runtime'. Expect a runtime identifier like linux-x64."
   fi
@@ -646,6 +675,8 @@ cmd_build() {
       -F "client_payload[project]=$name" \
       -F "client_payload[variant]=$variant" \
       -f "client_payload[signed]=$signed" \
+      -f "client_payload[native]=$native" \
+      -f "client_payload[abis]=$abis" \
       -f "client_payload[gist_id]=$gist_id" >/dev/null \
       || die "dispatch failed"
   fi

@@ -27,6 +27,13 @@ Uses JDK 17 and Gradle 9.6.0, matching AGP 9.4.x requirements. Prefers
 `gradle` binary otherwise, so projects without a committed wrapper still build.
 Packaging is always an `.apk` named `<project>-<variant>.apk`.
 
+`--native DIR` cross-compiles one Rust crate inside the project for the
+requested `--abis` (default `arm64-v8a`) with `cargo-ndk` and stages each
+`lib*.so` into the app module's `jniLibs`, so the Gradle build picks it up
+with no project changes. The crate must be self-contained within the
+packaged source (vendored or co-archived siblings for any path
+dependencies).
+
 Release builds are signed with a single release key shared by every project.
 See [Release signing](#release-signing).
 
@@ -259,7 +266,8 @@ Release signing adds four more secrets. `fbt key push` sets all of them; see
   need a bundle, which is not currently supported.
 - **Host Rust targets only.** Cross-compiling to `*-linux-android` targets
   needs the NDK and a configured linker. `--target` passes the triple through,
-  but only host builds are exercised.
+  but only host builds are exercised. Android apps with a Rust companion
+  should use `--native` on the Android pipeline instead.
 - **Go cross-compilation is pure Go.** `CGO_ENABLED=0` is always set, so a
   cross-compiled binary needs no cross toolchain, but a package that requires
   cgo will not build. Tests always run for the host, before any target

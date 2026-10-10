@@ -19,6 +19,11 @@ on:
         required: false
         type: string
         default: 'debug'
+      signed:
+        description: 'Sign the APK with the tool repo release key'
+        required: false
+        type: string
+        default: 'false'
 
 permissions:
   contents: read
@@ -39,9 +44,11 @@ jobs:
           EV_GIST: ${{ github.event.client_payload.gist_id }}
           EV_PROJECT: ${{ github.event.client_payload.project }}
           EV_VARIANT: ${{ github.event.client_payload.variant }}
+          EV_SIGNED: ${{ github.event.client_payload.signed }}
           IN_GIST: ${{ inputs.gist_id }}
           IN_PROJECT: ${{ inputs.project }}
           IN_VARIANT: ${{ inputs.variant }}
+          IN_SIGNED: ${{ inputs.signed }}
         run: |
           set -euo pipefail
           pick() {
@@ -51,8 +58,27 @@ jobs:
             echo "gist=$(pick "$EV_GIST" "$IN_GIST")"
             echo "project=$(pick "$EV_PROJECT" "$IN_PROJECT")"
             echo "variant=$(pick "$EV_VARIANT" "$IN_VARIANT")"
+            echo "signed=$(pick "$EV_SIGNED" "$IN_SIGNED")"
           } >> "$GITHUB_OUTPUT"
-          echo "project=${{ steps.params.outputs.project }} variant=${{ steps.params.outputs.variant }}"
+          echo "project=${{ steps.params.outputs.project }} variant=${{ steps.params.outputs.variant }} signed=${{ steps.params.outputs.signed }}"
+
+      - name: Validate inputs
+        env:
+          VARIANT: ${{ steps.params.outputs.variant }}
+          SIGNED: ${{ steps.params.outputs.signed }}
+        run: |
+          set -euo pipefail
+          # The variant becomes a Gradle task name, so it is held to what a task
+          # name can actually be rather than passed through.
+          if ! printf '%s' "$VARIANT" | grep -Eq '^[A-Za-z][A-Za-z0-9]*$'; then
+            echo "::error::invalid variant: '$VARIANT'"
+            exit 1
+          fi
+          case "$SIGNED" in
+            true|false) ;;
+            *) echo "::error::signed must be true or false, got '$SIGNED'"; exit 1 ;;
+          esac
+          echo "inputs ok"
 
       - name: Fetch source from secret gist
         env:
@@ -99,6 +125,73 @@ jobs:
         with:
           gradle-version: '9.6.0'
 
+      # After the JDK step: reading the certificate back out of the keystore
+      # needs keytool, and the fingerprint it yields is what the finished APK is
+      # checked against.
+      - name: Stage release signing key
+        id: signing
+        if: steps.params.outputs.signed == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          STORE_PASS: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in KEYSTORE_B64 STORE_PASS KEY_ALIAS KEY_PASS; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::signing requested but these secrets are not set on this repository:$missing"
+            echo "::error::run 'fbt key push' to upload a release key."
+            exit 1
+          fi
+
+          dir="$RUNNER_TEMP/fbt-signing"
+          umask 077
+          mkdir -p "$dir"
+          ks="$dir/release.keystore"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$ks"
+          chmod 600 "$ks"
+
+          fp="$(keytool -list -v -keystore "$ks" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" 2>/dev/null \
+                | awk '/SHA256:/ { l=$0; sub(/.*SHA256:[[:space:]]*/, "", l); gsub(/[:[:space:]]/, "", l); print tolower(l); exit }')"
+          if [ -z "$fp" ]; then
+            echo "::error::could not read alias '$KEY_ALIAS' from the release keystore."
+            exit 1
+          fi
+
+          # Written as Gradle properties rather than -P flags so the passwords
+          # never sit in the runner's process table for the length of the build.
+          gp="$HOME/.gradle/gradle.properties"
+          mkdir -p "$HOME/.gradle"
+          touch "$gp"
+          # Backslash is the only escape Java properties gives us, and a
+          # password containing one would otherwise be read back as truncated.
+          esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+          {
+            echo '# >>> fbt signing >>>'
+            # AGP honours these whatever the project's build file says, which is
+            # what makes this work for a project with no signingConfigs block.
+            echo "android.injected.signing.store.file=$ks"
+            echo "android.injected.signing.store.password=$(esc "$STORE_PASS")"
+            echo "android.injected.signing.key.alias=$KEY_ALIAS"
+            echo "android.injected.signing.key.password=$(esc "$KEY_PASS")"
+            # The same values under the names a project's own signingConfigs
+            # block conventionally reads. An explicit signingConfig wins over
+            # the injected ones, so a project that already has one still signs
+            # correctly.
+            echo "RELEASE_STORE_FILE=$ks"
+            echo "RELEASE_STORE_PASSWORD=$(esc "$STORE_PASS")"
+            echo "RELEASE_KEY_ALIAS=$KEY_ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$(esc "$KEY_PASS")"
+            echo '# <<< fbt signing <<<'
+          } >> "$gp"
+
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
+          echo "staged release key, alias '$KEY_ALIAS', cert SHA-256 $fp"
+
       - name: Build APK
         working-directory: src
         env:
@@ -141,6 +234,51 @@ jobs:
           echo "picked=$best" >> "$GITHUB_OUTPUT"
           echo "bytes=$(stat -c %s out.apk)" >> "$GITHUB_OUTPUT"
 
+      # A release build that silently comes out unsigned, or signed with the
+      # debug key because the project has no signingConfigs block, is the exact
+      # failure this catches. AGP falls back to debug signing rather than
+      # erroring, so nothing upstream complains.
+      - name: Verify release signature
+        id: verify
+        if: steps.params.outputs.signed == 'true'
+        working-directory: src
+        env:
+          EXPECTED: ${{ steps.signing.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          shopt -s nullglob
+          signers=("$sdk"/build-tools/*/apksigner)
+          if [ ${#signers[@]} -eq 0 ]; then
+            echo "::warning::no apksigner under $sdk/build-tools, skipping verification"
+            exit 0
+          fi
+          signer="$(printf '%s\n' "${signers[@]}" | sort -V | tail -1)"
+          echo "verifying with $signer"
+
+          if ! "$signer" verify --verbose --print-certs out.apk; then
+            echo "::error::out.apk is not signed. A release build must not produce an unsigned APK."
+            exit 1
+          fi
+
+          actual="$("$signer" verify --print-certs out.apk \
+            | awk '/Signer #1 certificate SHA-256 digest:/ {print tolower($NF); exit}')"
+          if [ -z "$actual" ]; then
+            echo "::error::could not read a signer certificate out of out.apk"
+            exit 1
+          fi
+          echo "signer cert SHA-256: $actual"
+
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::signed with the wrong key"
+            echo "::error::expected $EXPECTED"
+            echo "::error::got      $actual"
+            echo "::error::a project with no release signingConfig is signed by AGP with the debug key."
+            exit 1
+          fi
+
+          echo "certificate=$actual" >> "$GITHUB_OUTPUT"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -148,6 +286,28 @@ jobs:
           path: src/out.apk
           if-no-files-found: error
           retention-days: 14
+
+      # Both the keystore and the properties block that references it go, on
+      # failure and cancellation as well as success. The runner is discarded
+      # afterwards regardless, but a job that continues into a later step
+      # should not find either one still readable.
+      - name: Destroy signing material
+        if: always()
+        run: |
+          set -uo pipefail
+          dir="$RUNNER_TEMP/fbt-signing"
+          if [ -d "$dir" ]; then
+            find "$dir" -type f -exec shred -u {} + 2>/dev/null \
+              || find "$dir" -type f -delete 2>/dev/null \
+              || true
+            rm -rf "$dir"
+            echo "removed the release keystore from the runner"
+          fi
+          gp="$HOME/.gradle/gradle.properties"
+          if [ -f "$gp" ]; then
+            sed -i '/# >>> fbt signing >>>/,/# <<< fbt signing <<</d' "$gp"
+            echo "removed signing properties from gradle.properties"
+          fi
 
       - name: Delete source gist
         if: always()
@@ -170,12 +330,16 @@ jobs:
         env:
           PROJECT: ${{ steps.params.outputs.project }}
           VARIANT: ${{ steps.params.outputs.variant }}
+          SIGNED: ${{ steps.params.outputs.signed }}
           PICKED: ${{ steps.apk.outputs.picked }}
           BYTES: ${{ steps.apk.outputs.bytes }}
+          CERT: ${{ steps.verify.outputs.certificate }}
         run: |
           {
             echo "### fbt build"
             echo "- project: \`$PROJECT\`"
             echo "- variant: \`$VARIANT\`"
+            echo "- signed: \`$SIGNED\`"
+            [ -n "$CERT" ] && echo "- signing cert SHA-256: \`$CERT\`"
             echo "- apk: \`$PICKED\` (${BYTES:-0} bytes)"
           } >> "$GITHUB_STEP_SUMMARY"

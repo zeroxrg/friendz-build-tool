@@ -7,14 +7,28 @@
 #
 # Usage:
 #   fbt build <project-dir> [options]
+#   fbt keygen [--force]
+#   fbt key
 #
 # Config (optional):
 #   ~/.config/fbt/config
 #     TOOL_REPO=<owner>/<repo>
 #     DOWNLOAD_DIR=<path>
 #
+# Release signing (optional):
+#   The key itself is stored once as Actions secrets on the tool repo, so a
+#   signed build only sends signed=true. Locally, 'fbt keygen' records enough
+#   to push the key again and to print its fingerprint.
+#   ~/.config/fbt/signing.env
+#     RELEASE_KEYSTORE_PATH=<path to .p12 or .jks>
+#     RELEASE_KEYSTORE_PASSWORD=<keystore password>
+#     RELEASE_KEY_ALIAS=<alias>
+#     RELEASE_KEY_PASSWORD=<key password>
+#
 # Overrides without a config file:
 #   FBT_TOOL_REPO=<owner>/<repo> FBT_DOWNLOAD_DIR=<path> fbt build <dir>
+#   FBT_KEYSTORE=... FBT_KEYSTORE_PASSWORD=... FBT_KEY_ALIAS=...
+#   FBT_KEY_PASSWORD=... fbt key push
 
 set -euo pipefail
 
@@ -37,6 +51,95 @@ load_config() {
 
 require() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed."
+}
+
+# Everything fbt owns lives beside its config file, so FBT_CONFIG pointing
+# somewhere else moves the keystore and the credentials along with it.
+config_file() { printf '%s' "${FBT_CONFIG:-$HOME/.config/fbt/config}"; }
+signing_env_file() { printf '%s' "${FBT_SIGNING_ENV:-$(dirname "$(config_file)")/signing.env}"; }
+default_keystore() { printf '%s' "${FBT_KEYSTORE_PATH:-$(dirname "$(config_file)")/release.p12}"; }
+
+# Parsed without eval or source: a credentials file is exactly the kind of
+# thing that should never be executed. Unrecognised keys are ignored so a
+# file written for a newer fbt still works here.
+signing_read_env() {
+  local f="$1" line k v
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"
+    v="${line#*=}"
+    case "$k" in
+      RELEASE_KEYSTORE_PATH)        s_keystore="$v" ;;
+      RELEASE_KEYSTORE_PASSWORD)    s_store_pass="$v" ;;
+      RELEASE_STORE_PASSWORD)       s_store_pass="$v" ;;
+      RELEASE_KEY_ALIAS)            s_alias="$v" ;;
+      RELEASE_KEY_PASSWORD)         s_key_pass="$v" ;;
+    esac
+  done < "$f"
+}
+
+# Fills KS_PATH, KS_PASS, KEY_ALIAS, KEY_PASS. Environment wins over the file,
+# so a one-off push can override a single value without editing anything.
+resolve_signing() {
+  s_keystore="" s_store_pass="" s_alias="" s_key_pass=""
+  signing_read_env "$(signing_env_file)"
+
+  KS_PATH="${FBT_KEYSTORE:-${s_keystore:-}}"
+  KS_PASS="${FBT_KEYSTORE_PASSWORD:-${s_store_pass:-}}"
+  KEY_ALIAS="${FBT_KEY_ALIAS:-${s_alias:-}}"
+  KEY_PASS="${FBT_KEY_PASSWORD:-${s_key_pass:-}}"
+  # A keystore whose key password equals the store password is the normal case,
+  # and asking for it twice is noise.
+  KEY_PASS="${KEY_PASS:-$KS_PASS}"
+
+  [ -n "$KS_PATH" ] || die "no release keystore configured. Run 'fbt keygen' first, set FBT_KEYSTORE, or add RELEASE_KEYSTORE_PATH to $(signing_env_file)."
+  [ -f "$KS_PATH" ] || die "keystore not found: $KS_PATH. Run 'fbt keygen' or fix RELEASE_KEYSTORE_PATH in $(signing_env_file)."
+  [ -s "$KS_PATH" ] || die "keystore is empty: $KS_PATH"
+  [ -n "$KS_PASS" ]  || die "no keystore password. Set FBT_KEYSTORE_PASSWORD or RELEASE_KEYSTORE_PASSWORD."
+  [ -n "$KEY_ALIAS" ] || die "no key alias. Set FBT_KEY_ALIAS or RELEASE_KEY_ALIAS."
+
+  # A keystore anybody on the machine can read is a leaked keystore waiting to
+  # happen. Warn rather than refuse, since 0400 and 0600 both appear in the wild.
+  local mode
+  mode="$(stat -c '%a' "$KS_PATH" 2>/dev/null || echo '')"
+  # Group and other are the last two octal digits; 4 is read.
+  case "${mode: -2}" in
+    *4*) info "warning: keystore $KS_PATH is mode $mode, consider 'chmod 600'" ;;
+  esac
+
+  # A newline in a password would silently truncate it once it is written into
+  # a gradle.properties line, so refuse instead of producing a broken build.
+  local v
+  for v in "$KS_PASS" "$KEY_PASS"; do
+    case "$v" in
+      *$'\n'*|*$'\r'*) die "keystore passwords may not contain newlines" ;;
+    esac
+  done
+}
+
+# The signing key is stored once, as Actions secrets on the tool repo. The
+# build only ever sends signed=true; the runner reads the key from there. Naming
+# matches the convention used by project-side release workflows, so one key
+# serves both.
+SIGNING_SECRETS=(RELEASE_KEYSTORE_B64 RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD)
+
+# Prints the names of the signing secrets present on the tool repo.
+signing_secrets_present() {
+  local repo="$1"
+  gh secret list --repo "$repo" 2>/dev/null | awk '{print $1}'
+}
+
+# Fail before spending a gist upload and two runner minutes on a build that
+# cannot possibly sign.
+require_signing_secrets() {
+  local repo="$1" have want missing=""
+  have="$(signing_secrets_present "$repo" || true)"
+  for want in "${SIGNING_SECRETS[@]}"; do
+    printf '%s\n' "$have" | grep -qxF "$want" || missing="$missing $want"
+  done
+  [ -z "$missing" ] || die "tool repo $repo is missing signing secret(s):$missing
+Run 'fbt key push' to upload the local release key."
 }
 
 # Archive a project directory, honoring its .gitignore where possible.
@@ -80,12 +183,18 @@ package_project() {
 usage_build() {
   cat <<'USAGE'
 usage: fbt build <project-dir> [options]
+       fbt keygen [--alias NAME] [--dname DN] [--validity DAYS] [--force]
+       fbt key [--tool REPO]
+       fbt key push [--tool REPO]
 
 Common:
   --tool REPO        tool repo (owner/name)
 
 Android (default):
   --variant NAME     build variant (default: debug)
+  --release          release variant, signed with the tool repo's release key
+  --sign             sign the selected variant with the release key
+  --no-sign          release variant, left unsigned
 
 Rust (--rust):
   --profile NAME     release | dev            (default: release)
@@ -96,10 +205,244 @@ Rust (--rust):
   --tests            run cargo test before building
   --raw              upload bare binaries instead of a tarball
 
+Release signing, one-time setup:
+  fbt keygen         create ~/.config/fbt/release.p12 and signing.env
+  fbt key push       store it as a secret on the tool repo
+  fbt key            show the local key and which secrets the tool repo holds
+
 Examples:
   fbt build ./my-android-app
+  fbt build ./my-android-app --release
   fbt build ./my-crate --rust --tests
 USAGE
+}
+
+# SHA-256 of the signing certificate, which is what a release consumer checks a
+# downloaded artifact against. Printed in one lowercase hex form so it can be
+# pasted straight into a manifest.
+key_fingerprint() {
+  local ks="$1" pass="$2" alias="$3" fp=""
+  if command -v keytool >/dev/null 2>&1; then
+    fp="$(keytool -list -v -keystore "$ks" -storepass "$pass" -alias "$alias" 2>/dev/null \
+          | awk '/SHA256:/ { l=$0; sub(/.*SHA256:[[:space:]]*/, "", l); gsub(/[:[:space:]]/, "", l); print tolower(l); exit }')"
+  fi
+  if [ -z "$fp" ] && command -v openssl >/dev/null 2>&1; then
+    fp="$(openssl pkcs12 -in "$ks" -passin "pass:$pass" -nokeys -clcerts 2>/dev/null \
+          | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+          | sed 's/.*=//; s/://g' | tr 'A-Z' 'a-z')"
+  fi
+  printf '%s' "$fp"
+}
+
+cmd_keygen() {
+  local alias="release" dname="" validity=10000 force="false"
+  local env_file; env_file="$(signing_env_file)"
+  local ks_path; ks_path="$(default_keystore)"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --alias)    alias="${2:-}"; shift 2 ;;
+      --dname)    dname="${2:-}"; shift 2 ;;
+      --validity) validity="${2:-}"; shift 2 ;;
+      --force)    force="true"; shift ;;
+      -h|--help)  usage_build; exit 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  [ -n "$alias" ] || die "--alias needs a value"
+  case "$alias" in *[!A-Za-z0-9._-]*) die "alias may only contain letters, digits, dot, underscore and dash" ;; esac
+  case "$validity" in ''|*[!0-9]*) die "--validity needs a number of days" ;; esac
+
+  # The key is generated here, on the machine that will keep the backup, and
+  # never on a runner. A key that exists only inside CI is a key that is gone
+  # when CI is.
+  if [ -e "$ks_path" ] && [ "$force" != "true" ]; then
+    die "$ks_path already exists. Pass --force to replace it, but only if you are certain the old key is backed up: apps signed with it will never update."
+  fi
+
+  mkdir -p "$(dirname "$ks_path")"
+  chmod 700 "$(dirname "$ks_path")" 2>/dev/null || true
+  mkdir -p "$(dirname "$env_file")"
+
+  # prompt twice, never on the command line, so it stays out of shell history
+  # and out of this process's arguments.
+  local ks_pass key_pass
+  printf 'Keystore password (min 6 chars): ' >&2
+  IFS= read -r ks_pass
+  printf 'Confirm: ' >&2
+  local confirm
+  IFS= read -r confirm
+  [ "$ks_pass" = "$confirm" ] || die "passwords do not match"
+  [ "${#ks_pass}" -ge 6 ] || die "use at least 6 characters"
+  printf 'Key password (blank to reuse the keystore password): ' >&2
+  IFS= read -r key_pass
+  key_pass="${key_pass:-$ks_pass}"
+  [ "$key_pass" = "$ks_pass" ] || {
+    printf 'Confirm key password: ' >&2
+    IFS= read -r confirm
+    [ "$key_pass" = "$confirm" ] || die "passwords do not match"
+  }
+
+  [ -n "$dname" ] || dname="CN=$alias, OU=Android, O=fbt, C=US"
+
+  printf 'generating %s\n' "$ks_path" >&2
+  ( umask 077
+    if command -v keytool >/dev/null 2>&1; then
+      keytool -genkeypair -v \
+        -keystore "$ks_path" -storetype PKCS12 \
+        -alias "$alias" -keyalg RSA -keysize 4096 \
+        -validity "$validity" -dname "$dname" \
+        -storepass "$ks_pass" -keypass "$key_pass" >/dev/null
+    elif command -v openssl >/dev/null 2>&1; then
+      # PKCS#12 rather than JKS: keytool and AGP both read it, so a key made
+      # on a machine with openssl but no JDK still builds on a runner that has
+      # the opposite. Explicit PBEs keep openssl from emitting RC2, which Java
+      # 17 refuses to read.
+      local tmp
+      tmp="$(mktemp -d)"
+      openssl req -x509 -newkey rsa:4096 -nodes -days "$validity" \
+        -subj "/$dname" -keyout "$tmp/k.pem" -out "$tmp/c.pem" >/dev/null 2>&1
+      openssl pkcs12 -export \
+        -inkey "$tmp/k.pem" -in "$tmp/c.pem" -name "$alias" \
+        -passout "pass:$ks_pass" \
+        -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 \
+        -out "$ks_path"
+      rm -rf "$tmp"
+    else
+      die "neither keytool nor openssl is available. Install a JDK or run 'fbt keygen' on a machine that has one."
+    fi
+  ) || die "key generation failed"
+
+  chmod 600 "$ks_path"
+
+  local fp
+  fp="$(key_fingerprint "$ks_path" "$ks_pass" "$alias")"
+  [ -n "$fp" ] || die "could not read the generated key back. The keystore is at $ks_path; inspect it before trusting it."
+
+  ( umask 077
+    {
+      printf 'RELEASE_KEYSTORE_PATH=%s\n' "$ks_path"
+      printf 'RELEASE_KEYSTORE_PASSWORD=%s\n' "$ks_pass"
+      printf 'RELEASE_KEY_ALIAS=%s\n' "$alias"
+      printf 'RELEASE_KEY_PASSWORD=%s\n' "$key_pass"
+    } > "$env_file"
+  )
+  chmod 600 "$env_file"
+
+  info "keystore:  $ks_path"
+  info "alias:     $alias"
+  info "validity:  $validity days"
+  info "SHA-256:   $fp"
+  cat >&2 <<EOF
+
+  Copy $ks_path somewhere offline now, then run 'fbt key push' to store it as
+  a secret on the tool repo. If the key is lost, apps signed with it can never
+  be updated again, only uninstalled and reinstalled under a new id.
+EOF
+}
+
+cmd_key_push() {
+  local tool_repo="$TOOL_REPO"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tool) tool_repo="${2:-}"; shift 2 ;;
+      -h|--help) usage_build; exit 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$tool_repo" ] || die "no tool repo configured. Pass --tool <owner>/<repo> or set TOOL_REPO in ~/.config/fbt/config."
+  require gh
+  gh auth status >/dev/null 2>&1 || die "gh is not authenticated. Run 'gh auth login'."
+
+  resolve_signing
+
+  local fp
+  fp="$(key_fingerprint "$KS_PATH" "$KS_PASS" "$KEY_ALIAS")"
+  [ -n "$fp" ] || die "could not read the keystore with the recorded password and alias. Fix $(signing_env_file) and try again."
+
+  # Secrets cannot be read back, so this is the moment to be sure. Once it is
+  # overwritten and the local copy is gone, the key is unrecoverable.
+  local have
+  have="$(signing_secrets_present "$tool_repo" || true)"
+  if printf '%s\n' "$have" | grep -qxF RELEASE_KEYSTORE_B64; then
+    printf 'fbt: %s already has a release keystore.\n' "$tool_repo" >&2
+    printf 'fbt: local key SHA-256: %s\n' "$fp" >&2
+    printf 'fbt: replacing it re-points every future release build at the new key.\n' >&2
+    printf 'fbt: if any app was already published with the old key, it can never update again.\n' >&2
+    printf 'fbt: type "replace" to continue: ' >&2
+    local reply=""
+    IFS= read -r reply || die "aborted"
+    [ "$reply" = "replace" ] || die "aborted"
+  fi
+
+  info "uploading key to $tool_repo"
+  # Values go in on stdin, never as an argument, so they stay out of the process
+  # table and out of any shell trace.
+  base64 -w 0 "$KS_PATH" | gh secret set RELEASE_KEYSTORE_B64 --repo "$tool_repo"
+  printf '%s' "$KS_PASS"   | gh secret set RELEASE_KEYSTORE_PASSWORD --repo "$tool_repo"
+  printf '%s' "$KEY_ALIAS" | gh secret set RELEASE_KEY_ALIAS --repo "$tool_repo"
+  printf '%s' "$KEY_PASS"  | gh secret set RELEASE_KEY_PASSWORD --repo "$tool_repo"
+
+  info "stored 4 signing secrets"
+  info "alias   $KEY_ALIAS"
+  info "SHA-256 $fp"
+  cat >&2 <<'EOF'
+
+  These live as encrypted Actions secrets on a public repository. They are never
+  printed in logs and are not readable through the API, but every workflow that
+  runs there can use them. Keep an offline copy of the keystore: the secret
+  store is not a backup.
+EOF
+}
+
+cmd_key() {
+  local tool_repo="$TOOL_REPO"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tool) tool_repo="${2:-}"; shift 2 ;;
+      -h|--help) usage_build; exit 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  local env_file; env_file="$(signing_env_file)"
+  s_keystore="" s_store_pass="" s_alias="" s_key_pass=""
+  signing_read_env "$env_file"
+  local ks="${FBT_KEYSTORE:-${s_keystore:-}}" alias="${FBT_KEY_ALIAS:-${s_alias:-}}"
+  local pass="${FBT_KEYSTORE_PASSWORD:-${s_store_pass:-}}"
+
+  printf 'local:\n'
+  printf '  env file:   %s%s\n' "$env_file" "$([ -f "$env_file" ] || printf ' (missing)')"
+  if [ -z "$ks" ]; then
+    printf '  keystore:   not configured. Run "fbt keygen".\n'
+  elif [ ! -f "$ks" ]; then
+    printf '  keystore:   %s (missing)\n' "$ks"
+  else
+    printf '  keystore:   %s (%s, mode %s)\n' "$ks" "$(du -h "$ks" | cut -f1)" "$(stat -c '%a' "$ks")"
+    printf '  alias:      %s\n' "${alias:-unset}"
+    local fp=""
+    [ -n "$pass" ] && fp="$(key_fingerprint "$ks" "$pass" "$alias")"
+    printf '  SHA-256:    %s\n' "${fp:-unreadable (no password recorded, or the alias is wrong)}"
+  fi
+
+  printf 'tool repo:\n'
+  printf '  repository: %s\n' "${tool_repo:-unset}"
+  if [ -z "$tool_repo" ]; then
+    return 0
+  fi
+  local have missing="" want
+  have="$(signing_secrets_present "$tool_repo" || true)"
+  [ -n "$have" ] || have=""
+  for want in "${SIGNING_SECRETS[@]}"; do
+    if printf '%s\n' "$have" | grep -qxF "$want"; then
+      printf '  %s\n' "$want"
+    else
+      missing="$missing $want"
+    fi
+  done
+  [ -z "$missing" ] || printf '  missing:%s\n' "$missing"
+  return 0
 }
 
 cmd_build() {
@@ -107,6 +450,7 @@ cmd_build() {
 
   local dir="$1"; shift
   local variant="debug"
+  local signed="false"
   local tool_repo="$TOOL_REPO"
 
   local lang="android"
@@ -122,6 +466,9 @@ cmd_build() {
     case "$1" in
       --tool)    tool_repo="${2:-}"; shift 2 ;;
       --variant) variant="${2:-}"; shift 2 ;;
+      --release) variant="release"; signed="true"; shift ;;
+      --sign)    signed="true"; shift ;;
+      --no-sign) signed="false"; shift ;;
       --rust)    lang="rust"; shift ;;
       --profile) profile="${2:-}"; shift 2 ;;
       --target)  target="${2:-}"; shift 2 ;;
@@ -137,6 +484,11 @@ cmd_build() {
 
   [ -n "$tool_repo" ] || die "no tool repo configured. Pass --tool <owner>/<repo>, set TOOL_REPO in ~/.config/fbt/config, or export FBT_TOOL_REPO."
 
+  # Checked before anything is uploaded, so a flag combination that cannot work
+  # does not cost a gist and a delete.
+  [ "$signed" = "false" ] || [ "$lang" = "android" ] \
+    || die "--release and --sign are Android-only. Rust builds use --profile release, which is already the default."
+
   [ -d "$dir" ] || die "not a directory: $dir"
   dir="$(cd "$dir" && pwd)"
   local name; name="$(basename "$dir")"
@@ -146,6 +498,10 @@ cmd_build() {
   require git
 
   gh auth status >/dev/null 2>&1 || die "gh is not authenticated. Run 'gh auth login'."
+
+  # A missing secret should not cost a gist upload and two runner minutes to
+  # discover. Needs gh, so it happens after the auth check.
+  [ "$signed" = "true" ] && require_signing_secrets "$tool_repo"
 
   mkdir -p "$DOWNLOAD_DIR"
 
@@ -216,11 +572,12 @@ cmd_build() {
       -f "client_payload[raw]=$raw" >/dev/null \
       || die "dispatch failed"
   else
-    info "dispatching android build: variant=$variant"
+    info "dispatching android build: variant=$variant signed=$signed"
     gh api "repos/$tool_repo/dispatches" \
       -f "event_type=$event_type" \
       -F "client_payload[project]=$name" \
       -F "client_payload[variant]=$variant" \
+      -f "client_payload[signed]=$signed" \
       -f "client_payload[gist_id]=$gist_id" >/dev/null \
       || die "dispatch failed"
   fi
@@ -287,6 +644,15 @@ load_config
 
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;
-  ""|-h|--help) usage_build ;;
+  keygen) shift; cmd_keygen "$@" ;;
+  key)
+    shift
+    case "${1:-}" in
+      push) shift; cmd_key_push "$@" ;;
+      "")   cmd_key ;;
+      *) die "unknown key subcommand: $1. Try 'fbt key push'." ;;
+    esac
+    ;;
+  ""|-h|--help|help) usage_build ;;
   *) die "unknown command: $1" ;;
 esac

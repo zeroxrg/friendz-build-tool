@@ -198,8 +198,8 @@ jobs:
         working-directory: src
         env:
           FEATURES: ${{ steps.params.outputs.features }}
-          ALL: ${{ steps.params.outputs.all_features }}
-          NODEF: ${{ steps.params.outputs.no_default_features }}
+          ALL: ${{ steps.params.outputs.all }}
+          NODEF: ${{ steps.params.outputs.nodef }}
         run: |
           set -euo pipefail
           args=(--all-targets)
@@ -208,15 +208,19 @@ jobs:
           [ "$NODEF" = "true" ] && args+=(--no-default-features)
           cargo test "${args[@]}"
 
+      # id matters: the collect step reads triple and subdir from here, and
+      # without it they resolve empty, which collapses every candidate path to
+      # target/ and breaks any build that used --target.
       - name: Build
+        id: build
         working-directory: src
         env:
           ROOT: ${{ steps.crate.outputs.root }}
           PROFILE: ${{ steps.params.outputs.profile }}
           TARGET: ${{ steps.params.outputs.target }}
           FEATURES: ${{ steps.params.outputs.features }}
-          ALL: ${{ steps.params.outputs.all_features }}
-          NODEF: ${{ steps.params.outputs.no_default_features }}
+          ALL: ${{ steps.params.outputs.all }}
+          NODEF: ${{ steps.params.outputs.nodef }}
         run: |
           set -euo pipefail
           cd "$ROOT"

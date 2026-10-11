@@ -264,10 +264,12 @@ Release signing adds four more secrets. `fbt key push` sets all of them; see
   protect against.
 - **No AAB.** The Android pipeline always produces an `.apk`. Play Store uploads
   need a bundle, which is not currently supported.
-- **Host Rust targets only.** Cross-compiling to `*-linux-android` targets
-  needs the NDK and a configured linker. `--target` passes the triple through,
-  but only host builds are exercised. Android apps with a Rust companion
-  should use `--native` on the Android pipeline instead.
+- **Rust Android targets use the runner NDK.** Cross-compiling to
+  `*-linux-android` targets installs the target std and links against the
+  highest API-level clang found in the runner's NDK (`aarch64`, `armv7`,
+  `x86_64`, `i686`). Pure-Rust crates work; crates with C/C++ build scripts
+  need whatever those scripts expect. Android apps with a Rust companion
+  should still use `--native` on the Android pipeline instead.
 - **Go cross-compilation is pure Go.** `CGO_ENABLED=0` is always set, so a
   cross-compiled binary needs no cross toolchain, but a package that requires
   cgo will not build. Tests always run for the host, before any target

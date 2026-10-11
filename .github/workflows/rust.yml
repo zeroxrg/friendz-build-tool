@@ -161,6 +161,56 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: ${{ steps.params.outputs.target }}
+
+      - name: Configure Android NDK linker
+        if: contains(steps.params.outputs.target, 'android')
+        env:
+          TARGET: ${{ steps.params.outputs.target }}
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_ROOT:-}"
+          if [ -z "$ndk" ]; then
+            ndk="${ANDROID_NDK_HOME:-}"
+          fi
+          if [ -z "$ndk" ]; then
+            for candidate in "${ANDROID_HOME:-/usr/local/lib/android/sdk}/ndk/"*; do
+              if [ -d "$candidate" ]; then
+                ndk="$candidate"
+                break
+              fi
+            done
+          fi
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "::error::Android target requested but no NDK found on the runner."
+            exit 1
+          fi
+          echo "Using NDK: $ndk"
+          case "$TARGET" in
+            aarch64-*) prefix="aarch64-linux-android" ;;
+            armv7-*) prefix="armv7a-linux-androideabi" ;;
+            x86_64-*) prefix="x86_64-linux-android" ;;
+            i686-*) prefix="i686-linux-android" ;;
+            *)
+              echo "::error::Unsupported Android target triple: '$TARGET'"
+              exit 1
+              ;;
+          esac
+          clang=""
+          for api in 35 34 33 30 29 28 26 24 23 21; do
+            candidate="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/${prefix}${api}-clang"
+            if [ -x "$candidate" ]; then
+              clang="$candidate"
+              break
+            fi
+          done
+          if [ -z "$clang" ]; then
+            echo "::error::No NDK clang linker found for prefix '$prefix'."
+            exit 1
+          fi
+          echo "Using linker: $clang"
+          env_name="$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')"
+          echo "CARGO_TARGET_${env_name}_LINKER=$clang" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry and build dir
         uses: actions/cache@v4

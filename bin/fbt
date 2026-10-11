@@ -710,10 +710,15 @@ cmd_build() {
   local dest
   if [ "$lang" = "rust" ]; then
     # The workflow uploads a dist/ directory whose contents depend on the crate:
-    # a tarball or .bin files for binaries, .rlib for a library.
+    # a tarball or .bin files for binaries, .rlib for a library. Raw mode
+    # uploads bare binaries with no extension, so fall back to matching
+    # executable files when no suffixed artifact is present.
     mapfile -t files < <(find "$work/out" -type f \
       \( -name '*.tar.gz' -o -name '*.bin' -o -name '*.rlib' \
          -o -name '*.so' -o -name '*.dylib' -o -name '*.dll' -o -name '*.a' \) | sort)
+    if [ ${#files[@]} -eq 0 ]; then
+      mapfile -t files < <(find "$work/out" -type f -executable | sort)
+    fi
     [ ${#files[@]} -gt 0 ] || die "artifact contained no recognizable build output"
     local moved=()
     for f in "${files[@]}"; do

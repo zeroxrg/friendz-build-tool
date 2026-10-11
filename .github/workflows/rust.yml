@@ -209,8 +209,19 @@ jobs:
             exit 1
           fi
           echo "Using linker: $clang"
+          bindir="$(dirname "$clang")"
           env_name="$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')"
-          echo "CARGO_TARGET_${env_name}_LINKER=$clang" >> "$GITHUB_ENV"
+          {
+            echo "CARGO_TARGET_${env_name}_LINKER=$clang"
+            echo "CC_${TARGET}=$clang"
+            echo "CC_${TARGET//-/_}=$clang"
+            echo "TARGET_CC=$clang"
+            echo "CC=$clang"
+            echo "AR_${TARGET}=$bindir/llvm-ar"
+            echo "AR_${TARGET//-/_}=$bindir/llvm-ar"
+            echo "TARGET_AR=$bindir/llvm-ar"
+            echo "AR=$bindir/llvm-ar"
+          } >> "$GITHUB_ENV"
 
       - name: Cache cargo registry and build dir
         uses: actions/cache@v4

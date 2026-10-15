@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PIPELINES="$(dirname "$SCRIPT_DIR")/pipelines"
+DOWNLOAD_DIR="${FBT_DOWNLOAD_DIR:-$HOME/Downloads}"
+die() { printf 'fbt-local: %s\n' "$1" >&2; exit 1; }
+info() { printf '  %s\n' "$1" >&2; }
+config_file() { printf '%s' "${FBT_CONFIG:-$HOME/.config/fbt/config}"; }
+signing_env_file() { printf '%s' "${FBT_SIGNING_ENV:-$(dirname "$(config_file)")/signing.env}"; }
+default_keystore() { printf '%s' "${FBT_KEYSTORE_PATH:-$(dirname "$(config_file)")/release.p12}"; }
+package_project() {
+  local dir="$1"
+  local dest="$2"
+  if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    local dirty
+    dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$dirty" -gt 0 ]; then
+      info "note: $dirty uncommitted change(s) will be included"
+    fi
+    if git -C "$dir" ls-files --error-unmatch . >/dev/null 2>&1; then
+      if git -C "$dir" archive --format=tar.gz HEAD -o "$dest" 2>/dev/null; then
+        return 0
+      fi
+      info "git archive failed, falling back to tar"
+    fi
+  fi
+  tar czf "$dest" \
+    -C "$dir" \
+    --exclude='./build' \
+    --exclude='*/build' \
+    --exclude='./.gradle' \
+    --exclude='*/.gradle' \
+    --exclude='./.git' \
+    --exclude='*/.git' \
+    --exclude='./.idea' \
+    --exclude='*.apk' \
+    --exclude='*.aab' \
+    --exclude='local.properties' \
+    .
+}
+usage() {
+  cat <<'USAGE'
+usage: fbt-local build <project-dir> [options]
+       fbt-local keygen [--alias NAME] [--dname DN] [--validity DAYS] [--force]
+       fbt-local key
+
+Android (default):
+  --variant NAME     build variant (default: debug)
+  --release          release variant, signed with the local release key
+  --sign             sign the selected variant with the local release key
+  --no-sign          leave unsigned
+  --native DIR       Rust crate dir (relative) cross-compiled into jniLibs
+  --abis LIST        comma-separated ABIs (default: arm64-v8a)
+
+Rust (--rust):
+  --profile NAME     release | dev (default: release)
+  --target TRIPLE    rustc target triple (default: host)
+  --features LIST    comma-separated features
+  --all-features
+  --no-default-features
+  --tests
+  --raw              bare binaries instead of tarball
+
+Go (--go):
+  --goos NAME        e.g. linux, darwin (default: host)
+  --goarch NAME      e.g. amd64, arm64 (default: host)
+  --tests
+
+.NET (--dotnet):
+  --configuration NAME   Release | Debug (default: Release)
+  --runtime RID          e.g. linux-x64 (default: host)
+  --tests
+
+Common:
+  --out DIR          download directory (default: ~/Downloads)
+  --project NAME     override project name (default: directory basename)
+
+Local signing setup (shared with remote fbt):
+  fbt-local keygen    create ~/.config/fbt/release.p12 and signing.env
+  fbt-local key       show the local key fingerprint
+USAGE
+}
+key_fingerprint() {
+  local ks="$1" pass="$2" alias="$3" fp=""
+  if command -v keytool >/dev/null 2>&1; then
+    fp="$(keytool -list -v -keystore "$ks" -storepass "$pass" -alias "$alias" 2>/dev/null \
+          | awk '/SHA256:/ { l=$0; sub(/.*SHA256:[[:space:]]*/, "", l); gsub(/[:[:space:]]/, "", l); print tolower(l); exit }')"
+  fi
+  if [ -z "$fp" ] && command -v openssl >/dev/null 2>&1; then
+    fp="$(openssl pkcs12 -in "$ks" -passin "pass:$pass" -nokeys -clcerts 2>/dev/null \
+          | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+          | sed 's/.*=//; s/://g' | tr 'A-Z' 'a-z')"
+  fi
+  printf '%s' "$fp"
+}
+cmd_keygen() {
+  local alias="release" dname="" validity=10000 force="false"
+  local env_file; env_file="$(signing_env_file)"
+  local ks_path; ks_path="$(default_keystore)"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --alias) alias="${2:-}"; shift 2 ;;
+      --dname) dname="${2:-}"; shift 2 ;;
+      --validity) validity="${2:-}"; shift 2 ;;
+      --force) force="true"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$alias" ] || die "--alias needs a value"
+  case "$alias" in *[!A-Za-z0-9._-]*) die "alias may only contain letters, digits, dot, underscore and dash" ;; esac
+  case "$validity" in ''|*[!0-9]*) die "--validity needs a number of days" ;; esac
+  if [ -e "$ks_path" ] && [ "$force" != "true" ]; then
+    die "$ks_path already exists. Pass --force to replace it."
+  fi
+  mkdir -p "$(dirname "$ks_path")"
+  chmod 700 "$(dirname "$ks_path")" 2>/dev/null || true
+  mkdir -p "$(dirname "$env_file")"
+  local ks_pass key_pass confirm
+  printf 'Keystore password (min 6 chars): ' >&2
+  IFS= read -r ks_pass
+  printf 'Confirm: ' >&2
+  IFS= read -r confirm
+  [ "$ks_pass" = "$confirm" ] || die "passwords do not match"
+  [ "${#ks_pass}" -ge 6 ] || die "use at least 6 characters"
+  printf 'Key password (blank to reuse the keystore password): ' >&2
+  IFS= read -r key_pass
+  key_pass="${key_pass:-$ks_pass}"
+  if [ "$key_pass" != "$ks_pass" ]; then
+    printf 'Confirm key password: ' >&2
+    IFS= read -r confirm
+    [ "$key_pass" = "$confirm" ] || die "passwords do not match"
+  fi
+  [ -n "$dname" ] || dname="CN=$alias, OU=Android, O=fbt, C=US"
+  printf 'generating %s\n' "$ks_path" >&2
+  ( umask 077
+    if command -v keytool >/dev/null 2>&1; then
+      keytool -genkeypair -v \
+        -keystore "$ks_path" -storetype PKCS12 \
+        -alias "$alias" -keyalg RSA -keysize 4096 \
+        -validity "$validity" -dname "$dname" \
+        -storepass "$ks_pass" -keypass "$key_pass" >/dev/null
+    elif command -v openssl >/dev/null 2>&1; then
+      tmp="$(mktemp -d)"
+      openssl req -x509 -newkey rsa:4096 -nodes -days "$validity" \
+        -subj "/$dname" -keyout "$tmp/k.pem" -out "$tmp/c.pem" >/dev/null 2>&1
+      openssl pkcs12 -export \
+        -inkey "$tmp/k.pem" -in "$tmp/c.pem" -name "$alias" \
+        -passout "pass:$ks_pass" \
+        -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 \
+        -out "$ks_path"
+      rm -rf "$tmp"
+    else
+      die "neither keytool nor openssl is available"
+    fi
+  ) || die "key generation failed"
+  chmod 600 "$ks_path"
+  local fp
+  fp="$(key_fingerprint "$ks_path" "$ks_pass" "$alias")"
+  [ -n "$fp" ] || die "could not read the generated key back"
+  ( umask 077
+    {
+      printf 'RELEASE_KEYSTORE_PATH=%s\n' "$ks_path"
+      printf 'RELEASE_KEYSTORE_PASSWORD=%s\n' "$ks_pass"
+      printf 'RELEASE_KEY_ALIAS=%s\n' "$alias"
+      printf 'RELEASE_KEY_PASSWORD=%s\n' "$key_pass"
+    } > "$env_file"
+  )
+  chmod 600 "$env_file"
+  info "keystore:  $ks_path"
+  info "alias:     $alias"
+  info "SHA-256:   $fp"
+}
+cmd_key() {
+  local env_file; env_file="$(signing_env_file)"
+  local ks="" alias="" pass="" line k v
+  if [ -f "$env_file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      k="${line%%=*}"
+      v="${line#*=}"
+      case "$k" in
+        RELEASE_KEYSTORE_PATH) ks="$v" ;;
+        RELEASE_KEYSTORE_PASSWORD|RELEASE_STORE_PASSWORD) pass="$v" ;;
+        RELEASE_KEY_ALIAS) alias="$v" ;;
+      esac
+    done < "$env_file"
+  fi
+  ks="${FBT_KEYSTORE:-$ks}"
+  alias="${FBT_KEY_ALIAS:-$alias}"
+  pass="${FBT_KEYSTORE_PASSWORD:-$pass}"
+  printf 'env file: %s\n' "$env_file"
+  if [ -z "$ks" ]; then
+    printf 'keystore: not configured. Run "fbt-local keygen".\n'
+    return 0
+  fi
+  if [ ! -f "$ks" ]; then
+    printf 'keystore: %s (missing)\n' "$ks"
+    return 0
+  fi
+  printf 'keystore: %s\n' "$ks"
+  printf 'alias:    %s\n' "${alias:-unset}"
+  local fp=""
+  if [ -n "$pass" ]; then fp="$(key_fingerprint "$ks" "$pass" "$alias")"; fi
+  printf 'SHA-256:  %s\n' "${fp:-unreadable}"
+}
+cmd_build() {
+  [ $# -ge 1 ] || { usage; exit 1; }
+  local dir="$1"; shift
+  local variant="debug"
+  local signed="false"
+  local native=""
+  local abis="arm64-v8a"
+  local lang="android"
+  local profile="release"
+  local target=""
+  local features=""
+  local all_features="false"
+  local no_default_features="false"
+  local run_tests="false"
+  local raw="false"
+  local goos=""
+  local goarch=""
+  local configuration="Release"
+  local runtime=""
+  local out="$DOWNLOAD_DIR"
+  local name_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --variant) variant="${2:-}"; shift 2 ;;
+      --release) variant="release"; signed="true"; shift ;;
+      --sign) signed="true"; shift ;;
+      --no-sign) signed="false"; shift ;;
+      --native) native="${2:-}"; shift 2 ;;
+      --abis) abis="${2:-}"; shift 2 ;;
+      --rust) lang="rust"; shift ;;
+      --go) lang="go"; shift ;;
+      --dotnet) lang="dotnet"; shift ;;
+      --profile) profile="${2:-}"; shift 2 ;;
+      --target) target="${2:-}"; shift 2 ;;
+      --goos) goos="${2:-}"; shift 2 ;;
+      --goarch) goarch="${2:-}"; shift 2 ;;
+      --configuration) configuration="${2:-}"; shift 2 ;;
+      --runtime) runtime="${2:-}"; shift 2 ;;
+      --features) features="${2:-}"; shift 2 ;;
+      --all-features) all_features="true"; shift ;;
+      --no-default-features) no_default_features="true"; shift ;;
+      --tests) run_tests="true"; shift ;;
+      --raw) raw="true"; shift ;;
+      --out) out="${2:-}"; shift 2 ;;
+      --project) name_override="${2:-}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [ "$signed" = "false" ] || [ "$lang" = "android" ] \
+    || die "--release and --sign are Android-only"
+  [ -z "$native" ] || [ "$lang" = "android" ] \
+    || die "--native and --abis are Android-only"
+  [ -d "$dir" ] || die "not a directory: $dir"
+  dir="$(cd "$dir" && pwd)"
+  local name; name="${name_override:-$(basename "$dir")}"
+  command -v tar >/dev/null 2>&1 || die "tar is required"
+  command -v git >/dev/null 2>&1 || die "git is required"
+  mkdir -p "$out"
+  work="$(mktemp -d)"
+  trap "rm -rf '$work'" EXIT
+  info "packaging $name"
+  package_project "$dir" "$work/src.tar.gz" || die "packaging failed"
+  mkdir -p "$work/src"
+  tar xzf "$work/src.tar.gz" -C "$work/src"
+  rm -f "$work/src.tar.gz"
+  mkdir -p "$work/dist"
+  if [ "$lang" = "rust" ]; then
+    args=("$work/src" "$work/dist" --profile "$profile" --project "$name")
+    [ -n "$target" ] && args+=(--target "$target")
+    [ -n "$features" ] && args+=(--features "$features")
+    [ "$all_features" = "true" ] && args+=(--all-features)
+    [ "$no_default_features" = "true" ] && args+=(--no-default-features)
+    [ "$run_tests" = "true" ] && args+=(--tests)
+    [ "$raw" = "true" ] && args+=(--raw)
+    bash "$PIPELINES/rust.sh" "${args[@]}"
+    mapfile -t files < <(find "$work/dist" -type f | sort)
+    [ "${#files[@]}" -gt 0 ] || die "pipeline produced no output"
+    for f in "${files[@]}"; do
+      mv "$f" "$out/$(basename "$f")"
+      info "artifact: $out/$(basename "$f")"
+    done
+    dest="$out/$(basename "${files[0]}")"
+  elif [ "$lang" = "go" ]; then
+    args=("$work/src" "$work/dist" --project "$name")
+    [ -n "$goos" ] && args+=(--goos "$goos")
+    [ -n "$goarch" ] && args+=(--goarch "$goarch")
+    [ "$run_tests" = "true" ] && args+=(--tests)
+    bash "$PIPELINES/go.sh" "${args[@]}"
+    mapfile -t files < <(find "$work/dist" -type f | sort)
+    [ "${#files[@]}" -gt 0 ] || die "pipeline produced no output"
+    suffix=""
+    if [ -n "$goos" ] || [ -n "$goarch" ]; then suffix="-${goos:-host}-${goarch:-host}"; fi
+    for f in "${files[@]}"; do
+      mv "$f" "$out/$(basename "$f")$suffix"
+      info "binary: $out/$(basename "$f")$suffix"
+    done
+    dest="$out/$(basename "${files[0]}")$suffix"
+  elif [ "$lang" = "dotnet" ]; then
+    args=("$work/src" "$work/dist" --configuration "$configuration" --project "$name")
+    [ -n "$runtime" ] && args+=(--runtime "$runtime")
+    [ "$run_tests" = "true" ] && args+=(--tests)
+    bash "$PIPELINES/dotnet.sh" "${args[@]}"
+    mapfile -t files < <(find "$work/dist" -type f -name '*.tar.gz' | sort)
+    [ "${#files[@]}" -gt 0 ] || die "pipeline produced no output"
+    for f in "${files[@]}"; do
+      mv "$f" "$out/$(basename "$f")"
+      info "artifact: $out/$(basename "$f")"
+    done
+    dest="$out/$(basename "${files[0]}")"
+  else
+    args=("$work/src" "$work/dist" --variant "$variant" --project "$name" --abis "$abis")
+    [ "$signed" = "true" ] && args+=(--sign)
+    [ -n "$native" ] && args+=(--native "$native")
+    bash "$PIPELINES/android.sh" "${args[@]}"
+    apk="$(find "$work/dist" -name '*.apk' -type f | head -1)"
+    [ -n "$apk" ] || die "pipeline produced no APK"
+    dest="$out/$(basename "$apk")"
+    mv "$apk" "$dest"
+    info "APK: $dest"
+  fi
+  trap 'rm -rf "$work"' EXIT
+  printf '%s\n' "$dest"
+}
+case "${1:-}" in
+  build) shift; cmd_build "$@" ;;
+  keygen) shift; cmd_keygen "$@" ;;
+  key)
+    shift
+    case "${1:-}" in
+      "") cmd_key ;;
+      *) die "unknown key subcommand: $1" ;;
+    esac
+    ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $1" ;;
+esac

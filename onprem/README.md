@@ -28,7 +28,7 @@ onprem/bin/fbt-local build ./my-app --dotnet --runtime linux-x64
 
 Output lands in `~/Downloads` by default, or the directory given by `--out` / `FBT_DOWNLOAD_DIR`.
 
-Run `fbt-local --help` for the full flag list. Flags mirror `github/bin/fbt` except there is no `--tool` and no gist transport.
+Run `fbt-local --help` for the full flag list. Flags mirror `remote/bin/fbt` except there is no `--tool` and no gist transport.
 
 ## Toolchains
 
@@ -47,7 +47,7 @@ Missing toolchains fail with a plain message naming the binary. Nothing is auto-
 
 ## Signing
 
-Shared with the remote tool on purpose. `fbt-local keygen` writes the same files `github/bin/fbt` uses:
+Shared with the remote tool on purpose. `fbt-local keygen` writes the same files `remote/bin/fbt` uses:
 
 ```text
 ~/.config/fbt/release.p12

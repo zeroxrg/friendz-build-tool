@@ -8,7 +8,7 @@ When ready, expose the pipelines over the LAN so devices like the Chromebook can
 
 ```text
 # Chromebook -> http://server:8471/v1/build (tarball + JSON params)
-# Server queues one job at a time, runs onprem/pipelines/*.sh, serves artifact
+# Server queues one job at a time, runs local/pipelines/*.sh, serves artifact
 # Bearer token auth, LAN bind only, no inbound ports opened elsewhere
 ```
 
@@ -54,7 +54,7 @@ curl http://server:8471/v1/health
 # Description=fbt on-prem build server
 # After=network.target
 # [Service]
-# ExecStart=/usr/bin/python3 /path/to/onprem/server/serve.py --bind 127.0.0.1 --port 8471
+# ExecStart=/usr/bin/python3 /path/to/local/server/serve.py --bind 127.0.0.1 --port 8471
 # Restart=on-failure
 # [Install]
 # WantedBy=default.target

@@ -5,7 +5,7 @@ Build Android, Rust, Go, and .NET projects directly on this machine. No GitHub, 
 ## Layout
 
 ```text
-onprem/
+local/
   bin/fbt-local
   pipelines/android.sh
   pipelines/rust.sh
@@ -18,12 +18,12 @@ onprem/
 ## Usage
 
 ```bash
-onprem/bin/fbt-local build ./my-app
-onprem/bin/fbt-local build ./my-app --release
-onprem/bin/fbt-local build ./my-crate --rust --tests
-onprem/bin/fbt-local build ./my-cmd --go
-onprem/bin/fbt-local build ./my-cmd --go --goos windows --goarch amd64
-onprem/bin/fbt-local build ./my-app --dotnet --runtime linux-x64
+local/bin/fbt-local build ./my-app
+local/bin/fbt-local build ./my-app --release
+local/bin/fbt-local build ./my-crate --rust --tests
+local/bin/fbt-local build ./my-cmd --go
+local/bin/fbt-local build ./my-cmd --go --goos windows --goarch amd64
+local/bin/fbt-local build ./my-app --dotnet --runtime linux-x64
 ```
 
 Output lands in `~/Downloads` by default, or the directory given by `--out` / `FBT_DOWNLOAD_DIR`.
